@@ -128,15 +128,8 @@ struct TLACommands: Commands {
     }
 
     private func createNewFile() {
-        let newFile = TLAFile(
-            name: "NewSpec.tla",
-            type: .specification,
-            content: TLATemplates.basicSpecification
-        )
-        appState.openFile(newFile)
-        if appState.currentProject != nil {
-            appState.currentProject?.files.append(newFile)
-        }
+        // Post notification to show new file dialog
+        NotificationCenter.default.post(name: .showNewFileDialog, object: nil)
     }
 
     private func saveCurrentFile() {

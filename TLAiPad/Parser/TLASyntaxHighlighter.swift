@@ -182,6 +182,45 @@ extension TLASyntaxHighlighter {
         return attributedString
     }
 
+    /// Applies syntax highlighting attributes directly to existing NSTextStorage
+    /// This method does NOT replace the text content - it only modifies attributes
+    func applyHighlightingAttributes(to textStorage: NSTextStorage, font: NSFont = .monospacedSystemFont(ofSize: 13, weight: .regular), theme: HighlightTheme = .default) {
+        let source = textStorage.string
+        guard !source.isEmpty else { return }
+
+        let lexer = TLALexer(source: source)
+        let tokens = lexer.scanTokens()
+
+        for token in tokens {
+            guard token.length > 0 else { continue }
+
+            let offset = characterOffset(for: token, in: source)
+            guard offset < source.count else { continue }
+
+            let length = min(token.length, source.count - offset)
+            let range = NSRange(location: offset, length: length)
+
+            let (swiftUIColor, style) = colorAndStyle(for: token.type, theme: theme)
+            let nsColor = nsColor(from: swiftUIColor)
+
+            textStorage.addAttribute(.foregroundColor, value: nsColor, range: range)
+
+            // Apply font style
+            switch style {
+            case .bold:
+                if let boldFont = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) as NSFont? {
+                    textStorage.addAttribute(.font, value: boldFont, range: range)
+                }
+            case .italic:
+                if let italicFont = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) as NSFont? {
+                    textStorage.addAttribute(.font, value: italicFont, range: range)
+                }
+            case .normal:
+                break
+            }
+        }
+    }
+
     /// Convert SwiftUI Color to NSColor
     private func nsColor(from color: Color) -> NSColor {
         // Handle standard colors

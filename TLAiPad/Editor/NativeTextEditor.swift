@@ -156,15 +156,12 @@ struct EditorTextView: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
 
-        // Only update if text changed externally
-        if textView.string != text && !context.coordinator.isUpdating {
-            let selectedRanges = textView.selectedRanges
+        // Skip if we're in the middle of an internal update
+        guard !context.coordinator.isUpdating else { return }
+
+        // Only update if text changed externally (e.g., from binding)
+        if textView.string != text {
             context.coordinator.applyHighlighting(to: textView, newText: text)
-            // Restore selection if valid
-            if let firstRange = selectedRanges.first as? NSRange,
-               firstRange.location + firstRange.length <= text.count {
-                textView.setSelectedRange(firstRange)
-            }
         }
 
         // Update font if changed
@@ -218,11 +215,62 @@ struct EditorTextView: NSViewRepresentable {
                   let textView = notification.object as? NSTextView else { return }
 
             let newText = textView.string
+
+            // Update binding without triggering view update loop
+            isUpdating = true
             parent.text = newText
             parent.onTextChange?(newText)
+            isUpdating = false
 
-            // Re-apply highlighting
-            applyHighlighting(to: textView)
+            // Apply highlighting with a slight delay to avoid conflicts
+            applyHighlightingDebounced(to: textView)
+        }
+
+        private var highlightWorkItem: DispatchWorkItem?
+
+        private func applyHighlightingDebounced(to textView: NSTextView) {
+            highlightWorkItem?.cancel()
+
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self = self else { return }
+                self.applyHighlightingAttributesOnly(to: textView)
+            }
+            highlightWorkItem = workItem
+
+            // Small delay to batch rapid typing
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+        }
+
+        private func applyHighlightingAttributesOnly(to textView: NSTextView) {
+            guard !isUpdating else { return }
+            isUpdating = true
+            defer { isUpdating = false }
+
+            guard let textStorage = textView.textStorage, textStorage.length > 0 else { return }
+
+            let selectedRanges = textView.selectedRanges
+            let fullRange = NSRange(location: 0, length: textStorage.length)
+
+            textStorage.beginEditing()
+
+            // Reset to default attributes
+            textStorage.setAttributes([
+                .font: parent.font,
+                .foregroundColor: NSColor.textColor
+            ], range: fullRange)
+
+            // Apply syntax highlighting
+            TLASyntaxHighlighter.shared.applyHighlightingAttributes(to: textStorage, font: parent.font)
+
+            textStorage.endEditing()
+
+            // Restore selection
+            if let firstRange = selectedRanges.first as? NSRange,
+               firstRange.location + firstRange.length <= textStorage.length {
+                textView.setSelectedRange(firstRange)
+            }
+
+            updateBracketMatching(in: textView)
         }
 
         // Handle special keys like Enter for auto-indent
@@ -360,20 +408,38 @@ struct EditorTextView: NSViewRepresentable {
             isUpdating = true
             defer { isUpdating = false }
 
-            let text = newText ?? textView.string
             let selectedRanges = textView.selectedRanges
 
-            // Get highlighted attributed string
-            let highlighted = TLASyntaxHighlighter.shared.attributedStringForNSTextView(text, font: parent.font)
+            // If newText is provided and differs from current text, update text first
+            if let newText = newText, textView.string != newText {
+                // Use textStorage to avoid triggering textDidChange
+                if let textStorage = textView.textStorage {
+                    textStorage.beginEditing()
+                    textStorage.replaceCharacters(in: NSRange(location: 0, length: textStorage.length), with: newText)
+                    textStorage.endEditing()
+                }
+            }
 
-            // Apply to text storage
-            if let textStorage = textView.textStorage {
+            // Apply highlighting attributes WITHOUT replacing text content
+            // This prevents the race condition that causes text to vanish
+            if let textStorage = textView.textStorage, textStorage.length > 0 {
+                let fullRange = NSRange(location: 0, length: textStorage.length)
                 textStorage.beginEditing()
-                textStorage.setAttributedString(highlighted)
+
+                // Reset to default attributes first
+                textStorage.setAttributes([
+                    .font: parent.font,
+                    .foregroundColor: NSColor.textColor
+                ], range: fullRange)
+
+                // Apply syntax highlighting colors
+                TLASyntaxHighlighter.shared.applyHighlightingAttributes(to: textStorage, font: parent.font)
+
                 textStorage.endEditing()
             }
 
             // Restore selection
+            let text = textView.string
             if let firstRange = selectedRanges.first as? NSRange,
                firstRange.location + firstRange.length <= text.count {
                 textView.setSelectedRange(firstRange)

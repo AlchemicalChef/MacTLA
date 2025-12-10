@@ -12,21 +12,26 @@ MacTLA brings the full TLA+ specification and model checking experience to macOS
 - TLC-like BFS state space exploration
 - Invariant checking and deadlock detection
 - Counterexample trace generation
+- Weak and strong fairness checking (WF/SF)
 - Async verification with cancellation support
+- Detailed error reporting with suggestions
 
 ### Parser & Language Support
 - Complete TLA+ lexer and recursive descent parser
 - Full AST generation for modules, declarations, and expressions
 - PlusCal algorithm translation to pure TLA+
 - Support for all TLA+ operators (`/\`, `\/`, `\A`, `\E`, `[]`, `<>`, etc.)
+- Standard library functions (Len, Head, Tail, Append, Seq, etc.)
 
 ### Editor
-- Syntax highlighting for TLA+ and PlusCal
+- Native NSTextView-based editor with syntax highlighting
+- Bracket matching with visual highlighting
+- Auto-indentation for TLA+ constructs
 - Context-aware code completion
 - Real-time diagnostics (errors and warnings)
-- Symbol navigator with go-to-definition
+- Symbol navigator with Cmd+Click go-to-definition
 - Search and replace with regex support
-- Line numbers and minimap
+- Line numbers gutter
 
 ### Visualization
 - Interactive force-directed state graph
@@ -40,13 +45,25 @@ MacTLA brings the full TLA+ specification and model checking experience to macOS
 - Auto-save with file persistence
 - Project organization with multiple files
 - Support for `.tla`, `.cfg`, and `.tlaps` files
+- Built-in templates (Basic, Mutex, Producer-Consumer, Two-Phase Commit, Raft)
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/editor.png" width="800" alt="MacTLA Editor">
+</p>
 
 ## Requirements
 
 - macOS 14.0+
 - Xcode 15+ (for building)
-- Swift 5.9
+- Swift 5.9+
 - XcodeGen (for project generation)
+
+```bash
+# Install XcodeGen via Homebrew
+brew install xcodegen
+```
 
 ## Building
 
@@ -88,6 +105,8 @@ TLAiPad/
 | `ModelChecker` | Swift actor for async state exploration |
 | `TLAInterpreter` | Evaluates TLA+ expressions |
 | `PlusCalTranslator` | Translates PlusCal to pure TLA+ |
+| `NativeTextEditor` | NSTextView wrapper with syntax highlighting |
+| `TLASyntaxHighlighter` | Token-based syntax coloring |
 | `StateGraphView` | Force-directed graph visualization |
 
 ## Testing
@@ -122,6 +141,15 @@ Test coverage includes:
 | ⌘/ | Toggle Comment |
 | ⌘⇧O | Show Symbol Navigator |
 
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues and pull requests.
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Acknowledgments
+
+- Inspired by the [TLA+ Toolbox](https://lamport.azurewebsites.net/tla/toolbox.html) by Leslie Lamport
+- Built with SwiftUI and AppKit for native macOS performance

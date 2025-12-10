@@ -29,6 +29,7 @@ struct EditorDetailView: View {
                     configEditorContent(for: file)
                 } else {
                     TLAEditorView(file: binding(for: file))
+                        .id(file.id)  // Force view recreation when file changes
                 }
 
                 // Verification results panel
@@ -106,15 +107,18 @@ struct EditorDetailView: View {
     }
 
     private func binding(for file: TLAFile) -> Binding<TLAFile> {
-        guard let index = appState.openFiles.firstIndex(where: { $0.id == file.id }) else {
-            // Return a binding to a copy of the file if not found (edge case during file close)
-            var fileCopy = file
-            return Binding(
-                get: { fileCopy },
-                set: { fileCopy = $0 }
-            )
-        }
-        return $appState.openFiles[index]
+        // Use id-based binding to avoid stale index issues when files are added/removed
+        let fileId = file.id
+        return Binding(
+            get: {
+                appState.openFiles.first { $0.id == fileId } ?? file
+            },
+            set: { newValue in
+                if let index = appState.openFiles.firstIndex(where: { $0.id == fileId }) {
+                    appState.openFiles[index] = newValue
+                }
+            }
+        )
     }
 
     private func updateDiagnostics(for content: String) {
@@ -164,6 +168,8 @@ struct EmptyEditorView: View {
     @ObservedObject private var fileStorage = FileStorage.shared
     @State private var showError = false
     @State private var errorMessage = ""
+    @State private var showNewFileDialog = false
+    @State private var newFileName = "Untitled"
 
     var body: some View {
         VStack(spacing: 32) {
@@ -189,7 +195,7 @@ struct EmptyEditorView: View {
 
             // Action buttons
             VStack(spacing: 16) {
-                Button(action: createNewFile) {
+                Button(action: { showNewFileDialog = true }) {
                     Label("New Specification", systemImage: "doc.badge.plus")
                         .frame(minWidth: 200)
                 }
@@ -231,11 +237,30 @@ struct EmptyEditorView: View {
         } message: {
             Text(errorMessage)
         }
+        .alert("New Specification", isPresented: $showNewFileDialog) {
+            TextField("File name", text: $newFileName)
+            Button("Cancel", role: .cancel) {
+                newFileName = "Untitled"
+            }
+            Button("Create") {
+                createNewFile(named: newFileName)
+                newFileName = "Untitled"
+            }
+        } message: {
+            Text("Enter a name for the new TLA+ specification")
+        }
     }
 
-    private func createNewFile() {
+    private func createNewFile(named name: String) {
+        var fileName = name.trimmingCharacters(in: .whitespaces)
+        if fileName.isEmpty {
+            fileName = "Untitled"
+        }
+        if !fileName.hasSuffix(".tla") {
+            fileName += ".tla"
+        }
         let newFile = TLAFile(
-            name: "Untitled.tla",
+            name: fileName,
             type: .specification,
             content: TLATemplates.basicSpecification
         )

@@ -9,6 +9,8 @@ struct ContentView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var graphStates: [GraphState] = []
     @State private var graphTransitions: [GraphTransition] = []
+    @State private var showNewFileDialog = false
+    @State private var newFileName = "NewSpec"
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -37,7 +39,7 @@ struct ContentView: View {
                         }
                     }
                     Divider()
-                    Button(action: createNewFile) {
+                    Button(action: { showNewFileDialog = true }) {
                         Label("New Specification", systemImage: "doc.badge.plus")
                     }
                 } label: {
@@ -95,7 +97,7 @@ struct ContentView: View {
                         }
                     }
                     Divider()
-                    Button(action: createNewFile) {
+                    Button(action: { showNewFileDialog = true }) {
                         Label("New Specification", systemImage: "doc.badge.plus")
                     }
                 } label: {
@@ -189,6 +191,21 @@ struct ContentView: View {
         } message: {
             Text(documentManager.errorMessage ?? "An unknown error occurred")
         }
+        .alert("New Specification", isPresented: $showNewFileDialog) {
+            TextField("File name", text: $newFileName)
+            Button("Cancel", role: .cancel) {
+                newFileName = "NewSpec"
+            }
+            Button("Create") {
+                createNewFile(named: newFileName)
+                newFileName = "NewSpec"
+            }
+        } message: {
+            Text("Enter a name for the new TLA+ specification")
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showNewFileDialog)) { _ in
+            showNewFileDialog = true
+        }
     }
 
     #if os(macOS)
@@ -277,9 +294,16 @@ struct ContentView: View {
         }
     }
 
-    private func createNewFile() {
+    private func createNewFile(named name: String) {
+        var fileName = name.trimmingCharacters(in: .whitespaces)
+        if fileName.isEmpty {
+            fileName = "NewSpec"
+        }
+        if !fileName.hasSuffix(".tla") {
+            fileName += ".tla"
+        }
         let newFile = TLAFile(
-            name: "NewSpec.tla",
+            name: fileName,
             type: .specification,
             content: TLATemplates.basicSpecification
         )

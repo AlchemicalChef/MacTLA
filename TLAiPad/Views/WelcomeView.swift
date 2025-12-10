@@ -13,6 +13,8 @@ struct WelcomeView: View {
     @State private var selectedTemplate: TemplateOption?
     @State private var showImportError = false
     @State private var importErrorMessage = ""
+    @State private var showNewFileDialog = false
+    @State private var newFileName = "NewSpec"
 
     var body: some View {
         NavigationStack {
@@ -49,7 +51,7 @@ struct WelcomeView: View {
                             systemImage: "doc.badge.plus",
                             color: .blue
                         ) {
-                            createNewSpecification()
+                            showNewFileDialog = true
                         }
                         .help("Create a new TLA+ specification (⌘N)")
 
@@ -182,12 +184,31 @@ struct WelcomeView: View {
             } message: {
                 Text(importErrorMessage)
             }
+            .alert("New Specification", isPresented: $showNewFileDialog) {
+                TextField("File name", text: $newFileName)
+                Button("Cancel", role: .cancel) {
+                    newFileName = "NewSpec"
+                }
+                Button("Create") {
+                    createNewSpecification(named: newFileName)
+                    newFileName = "NewSpec"
+                }
+            } message: {
+                Text("Enter a name for the new TLA+ specification")
+            }
         }
     }
 
-    private func createNewSpecification() {
+    private func createNewSpecification(named name: String) {
+        var fileName = name.trimmingCharacters(in: .whitespaces)
+        if fileName.isEmpty {
+            fileName = "NewSpec"
+        }
+        if !fileName.hasSuffix(".tla") {
+            fileName += ".tla"
+        }
         let newFile = TLAFile(
-            name: "NewSpec.tla",
+            name: fileName,
             type: .specification,
             content: TLATemplates.basicSpecification
         )

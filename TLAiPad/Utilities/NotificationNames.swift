@@ -9,6 +9,7 @@ extension Notification.Name {
     static let showGoToLine = Notification.Name("showGoToLine")
     static let toggleComment = Notification.Name("toggleComment")
     static let saveFile = Notification.Name("saveFile")
+    static let showNewFileDialog = Notification.Name("showNewFileDialog")
 
     // Navigation
     static let navigateToLine = Notification.Name("navigateToLine")
