@@ -228,8 +228,43 @@ struct ContentView: View {
             appState.isVerifying = true
             defer { appState.isVerifying = false }
 
+            // Find associated .cfg file or use default config
+            let config = findConfig(for: file)
+
+            // Convert TLCConfig to ModelChecker parameters
+            let checkerConfig = ModelChecker.Configuration(
+                workers: config.workers,
+                maxStates: config.maxStates,
+                maxDepth: config.maxDepth,
+                checkDeadlock: config.checkDeadlock,
+                checkInvariants: true,
+                checkProperties: !config.properties.isEmpty,
+                checkLiveness: !config.properties.isEmpty || config.properties.isEmpty // Check liveness by default
+            )
+
+            // Convert constants
+            let constants = config.constants.filter { !$0.name.isEmpty && !$0.value.isEmpty }.map {
+                ModelChecker.ConstantOverride(name: $0.name, value: $0.value)
+            }
+
+            // Convert invariants
+            let invariants = config.invariants.filter { !$0.name.isEmpty }.map {
+                ModelChecker.InvariantSpec(name: $0.name)
+            }
+
+            // Convert properties
+            let properties = config.properties.filter { !$0.name.isEmpty }.map {
+                ModelChecker.PropertySpec(name: $0.name)
+            }
+
             let checker = ModelChecker()
-            let result = await checker.verify(specification: file.content)
+            let result = await checker.verify(
+                specification: file.content,
+                config: checkerConfig,
+                constants: constants,
+                invariants: invariants,
+                properties: properties
+            )
             appState.verificationResults.append(result)
 
             // Build graph for visualization (simplified)
@@ -237,6 +272,28 @@ struct ContentView: View {
                 buildStateGraph(from: result)
             }
         }
+    }
+
+    /// Finds the configuration for a given file
+    private func findConfig(for file: TLAFile) -> TLCConfig {
+        // Look for a .cfg file with matching name
+        let baseName = file.name.replacingOccurrences(of: ".tla", with: "")
+        let cfgFileName = baseName + ".cfg"
+
+        // Check in current project's files
+        if let project = appState.currentProject {
+            if let cfgFile = project.files.first(where: { $0.name == cfgFileName && $0.type == .config }) {
+                return TLCConfig.parse(from: cfgFile.content)
+            }
+        }
+
+        // Check in open files
+        if let cfgFile = appState.openFiles.first(where: { $0.name == cfgFileName && $0.type == .config }) {
+            return TLCConfig.parse(from: cfgFile.content)
+        }
+
+        // Return default config
+        return TLCConfig()
     }
 
     private func buildStateGraph(from result: VerificationResult) {

@@ -5,6 +5,88 @@ final class TLAInterpreter {
     /// Maximum recursion depth to prevent stack overflow
     private static let maxRecursionDepth = 1000
 
+    /// Constant overrides from configuration
+    private var constantOverrides: [String: TLAValue] = [:]
+
+    /// Sets a constant value from configuration
+    /// - Parameters:
+    ///   - name: The constant name
+    ///   - valueString: The value as a string (e.g., "3", "{a, b, c}", "<<1, 2, 3>>")
+    func setConstant(name: String, valueString: String) {
+        // Parse the value string into a TLAValue
+        if let value = parseConstantValue(valueString) {
+            constantOverrides[name] = value
+        }
+    }
+
+    /// Parses a constant value string into a TLAValue
+    private func parseConstantValue(_ str: String) -> TLAValue? {
+        let trimmed = str.trimmingCharacters(in: .whitespaces)
+
+        // Integer
+        if let n = Int(trimmed) {
+            return .integer(n)
+        }
+
+        // Boolean
+        if trimmed == "TRUE" || trimmed == "true" {
+            return .boolean(true)
+        }
+        if trimmed == "FALSE" || trimmed == "false" {
+            return .boolean(false)
+        }
+
+        // String (quoted)
+        if trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"") {
+            return .string(String(trimmed.dropFirst().dropLast()))
+        }
+
+        // Set enumeration: {a, b, c}
+        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
+            let inner = String(trimmed.dropFirst().dropLast())
+            if inner.isEmpty {
+                return .set([])
+            }
+            let elements = inner.components(separatedBy: ",").compactMap { elem -> TLAValue? in
+                return parseConstantValue(elem.trimmingCharacters(in: .whitespaces))
+            }
+            return .set(Set(elements))
+        }
+
+        // Sequence: <<a, b, c>>
+        if trimmed.hasPrefix("<<") && trimmed.hasSuffix(">>") {
+            let inner = String(trimmed.dropFirst(2).dropLast(2))
+            if inner.isEmpty {
+                return .sequence([])
+            }
+            let elements = inner.components(separatedBy: ",").compactMap { elem -> TLAValue? in
+                return parseConstantValue(elem.trimmingCharacters(in: .whitespaces))
+            }
+            return .sequence(elements)
+        }
+
+        // Range: m..n
+        if trimmed.contains("..") {
+            let parts = trimmed.components(separatedBy: "..")
+            if parts.count == 2,
+               let low = Int(parts[0].trimmingCharacters(in: .whitespaces)),
+               let high = Int(parts[1].trimmingCharacters(in: .whitespaces)) {
+                if low <= high {
+                    return .set(Set((low...high).map { TLAValue.integer($0) }))
+                } else {
+                    return .set([])
+                }
+            }
+        }
+
+        // Model value (unquoted identifier)
+        if trimmed.first?.isLetter == true {
+            return .modelValue(trimmed)
+        }
+
+        return nil
+    }
+
     struct Environment {
         var variables: [String: TLAValue]
         var constants: [String: TLAValue]
@@ -466,8 +548,12 @@ final class TLAInterpreter {
             }
             throw InterpreterError.evaluationError("CASE: no condition matched and no OTHER clause")
 
-        // Temporal operators - these require model checking context
-        case .always, .eventually, .leadsto, .enabled, .stuttering, .action, .weakFairness, .strongFairness:
+        // ENABLED operator - checks if action can be taken from current state
+        case .enabled(let actionExpr, _):
+            return try evaluateEnabled(actionExpr, in: env)
+
+        // Other temporal operators - these require model checking context
+        case .always, .eventually, .leadsto, .stuttering, .action, .weakFairness, .strongFairness:
             throw InterpreterError.notImplemented("Temporal operators require model checking context")
 
         default:
@@ -913,6 +999,64 @@ final class TLAInterpreter {
         return .boolean(false)
     }
 
+    /// Evaluates ENABLED action - checks if action can be taken from current state
+    /// An action is enabled if there exists some assignment to primed variables
+    /// that makes the action predicate true.
+    private func evaluateEnabled(_ actionExpr: TLAExpression, in env: Environment) throws -> TLAValue {
+        // Get current variable names (non-primed)
+        let currentVars = env.variables.keys.filter { !$0.hasSuffix("'") }
+
+        // Generate possible assignments to primed variables
+        // We use the same values as current state plus neighbors
+        var possibleValues: Set<TLAValue> = []
+        for (_, value) in env.variables {
+            possibleValues.insert(value)
+            // Add neighboring values for integers
+            if case .integer(let n) = value {
+                possibleValues.insert(.integer(n + 1))
+                possibleValues.insert(.integer(n - 1))
+            }
+        }
+        // Add common defaults
+        possibleValues.insert(.boolean(true))
+        possibleValues.insert(.boolean(false))
+        possibleValues.insert(.integer(0))
+        possibleValues.insert(.integer(1))
+
+        let possibleValuesArray = Array(possibleValues)
+
+        // Try all combinations of primed variable assignments
+        func tryAssignments(vars: [String], currentEnv: Environment) -> Bool {
+            guard let varName = vars.first else {
+                // All primed variables assigned, evaluate the action
+                do {
+                    let result = try evaluate(actionExpr, in: currentEnv)
+                    if case .boolean(true) = result {
+                        return true
+                    }
+                } catch {
+                    // Action threw error with this assignment - not enabled
+                }
+                return false
+            }
+
+            let remaining = Array(vars.dropFirst())
+            let primedName = varName + "'"
+
+            for value in possibleValuesArray {
+                var newEnv = currentEnv
+                newEnv.variables[primedName] = value
+                if tryAssignments(vars: remaining, currentEnv: newEnv) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        let isEnabled = tryAssignments(vars: Array(currentVars), currentEnv: env)
+        return .boolean(isEnabled)
+    }
+
     // MARK: - Integer Arithmetic Helpers
 
     /// Integer-only exponentiation using binary exponentiation algorithm.
@@ -1252,10 +1396,21 @@ final class TLAInterpreter {
             case .operatorDef(let def):
                 env.operators[def.name] = def
             case .constant(let constDecl):
-                // Initialize constants as model values (symbolic placeholders)
-                // In a full implementation, these would come from a config file
+                // Initialize constants - use override if available, otherwise model value
                 for name in constDecl.names {
-                    env.constants[name] = .modelValue(name)
+                    if let overrideValue = constantOverrides[name] {
+                        env.constants[name] = overrideValue
+                    } else {
+                        env.constants[name] = .modelValue(name)
+                    }
+                }
+            case .instance(let instanceDecl):
+                // Handle INSTANCE declarations using ModuleRegistry
+                do {
+                    try ModuleRegistry.shared.instantiate(instanceDecl, into: &env, module: module)
+                } catch {
+                    // Log error but continue - standard modules are handled as built-ins
+                    print("Warning: Could not instantiate module \(instanceDecl.moduleName): \(error)")
                 }
             default:
                 break

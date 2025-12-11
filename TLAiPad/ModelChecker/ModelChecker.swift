@@ -79,7 +79,29 @@ actor ModelChecker {
     private var initialStateHashes: Set<StateHash> = []
     private var errorStateHashes: Set<StateHash> = []
 
-    func verify(specification: String, config: Configuration = .default) async -> VerificationResult {
+    /// Constant override from configuration
+    struct ConstantOverride {
+        let name: String
+        let value: String
+    }
+
+    /// Explicit invariant from configuration
+    struct InvariantSpec {
+        let name: String
+    }
+
+    /// Explicit temporal property from configuration
+    struct PropertySpec {
+        let name: String
+    }
+
+    func verify(
+        specification: String,
+        config: Configuration = .default,
+        constants: [ConstantOverride] = [],
+        invariants: [InvariantSpec] = [],
+        properties: [PropertySpec] = []
+    ) async -> VerificationResult {
         guard !isRunning else {
             return VerificationResult(
                 specificationName: "Unknown",
@@ -92,6 +114,11 @@ actor ModelChecker {
         shouldCancel = false
         configuration = config
         statistics = Statistics()
+
+        // Store config for use in checkModel
+        self.constantOverrides = constants
+        self.explicitInvariants = invariants
+        self.explicitProperties = properties
 
         // Reset state tracking
         exploredStates = []
@@ -119,12 +146,146 @@ actor ModelChecker {
         }
     }
 
+    // Storage for config-based settings
+    private var constantOverrides: [ConstantOverride] = []
+    private var explicitInvariants: [InvariantSpec] = []
+    private var explicitProperties: [PropertySpec] = []
+
     func cancel() {
         shouldCancel = true
     }
 
+    // MARK: - Parallel Processing Support
+
+    /// Result from processing a single state in parallel
+    struct BatchResult: Sendable {
+        let fromHash: StateHash
+        let depth: Int
+        let successors: [TLAState]
+        let successorTraces: [[TLAState]]
+        let isDeadlock: Bool
+        let error: VerificationResult?
+    }
+
+    /// Processes a single state for parallel BFS
+    private func processState(
+        _ state: TLAState,
+        trace: [TLAState],
+        module: TLAModule,
+        nextDef: OperatorDefinition,
+        invariants: [OperatorDefinition],
+        interpreter: TLAInterpreter,
+        configuration: Configuration
+    ) async -> BatchResult {
+        let currentHash = state.hash
+        let depth = trace.count
+
+        // Skip if beyond max depth
+        if depth > configuration.maxDepth {
+            return BatchResult(
+                fromHash: currentHash,
+                depth: depth,
+                successors: [],
+                successorTraces: [],
+                isDeadlock: false,
+                error: nil
+            )
+        }
+
+        // Check invariants
+        if configuration.checkInvariants {
+            for invariant in invariants {
+                do {
+                    let holds = try interpreter.evaluateInvariant(invariant, state: state, module: module)
+                    if !holds {
+                        return BatchResult(
+                            fromHash: currentHash,
+                            depth: depth,
+                            successors: [],
+                            successorTraces: [],
+                            isDeadlock: false,
+                            error: VerificationResult(
+                                specificationName: module.name,
+                                status: .failure,
+                                error: "Invariant \(invariant.name) violated",
+                                counterexample: trace.map { s in
+                                    TraceState(variables: s.variables.mapValues { $0.description })
+                                }
+                            )
+                        )
+                    }
+                } catch {
+                    return BatchResult(
+                        fromHash: currentHash,
+                        depth: depth,
+                        successors: [],
+                        successorTraces: [],
+                        isDeadlock: false,
+                        error: VerificationResult(
+                            specificationName: module.name,
+                            status: .error,
+                            error: "Error checking invariant \(invariant.name): \(error)"
+                        )
+                    )
+                }
+            }
+        }
+
+        // Generate successor states
+        do {
+            let successors = try interpreter.evaluateNext(nextDef, state: state, module: module)
+
+            if successors.isEmpty && configuration.checkDeadlock {
+                return BatchResult(
+                    fromHash: currentHash,
+                    depth: depth,
+                    successors: [],
+                    successorTraces: [],
+                    isDeadlock: true,
+                    error: VerificationResult(
+                        specificationName: module.name,
+                        status: .failure,
+                        error: "Deadlock detected",
+                        counterexample: trace.map { s in
+                            TraceState(variables: s.variables.mapValues { $0.description })
+                        }
+                    )
+                )
+            }
+
+            let successorTraces = successors.map { trace + [$0] }
+
+            return BatchResult(
+                fromHash: currentHash,
+                depth: depth,
+                successors: successors,
+                successorTraces: successorTraces,
+                isDeadlock: false,
+                error: nil
+            )
+        } catch {
+            return BatchResult(
+                fromHash: currentHash,
+                depth: depth,
+                successors: [],
+                successorTraces: [],
+                isDeadlock: false,
+                error: VerificationResult(
+                    specificationName: module.name,
+                    status: .error,
+                    error: "Error evaluating Next: \(error)"
+                )
+            )
+        }
+    }
+
     private func checkModel(_ module: TLAModule) async -> VerificationResult {
         let interpreter = TLAInterpreter()
+
+        // Apply constant overrides to interpreter
+        for override in constantOverrides {
+            interpreter.setConstant(name: override.name, valueString: override.value)
+        }
 
         // Find Init and Next
         guard let initDef = findOperator(named: "Init", in: module),
@@ -136,8 +297,8 @@ actor ModelChecker {
             )
         }
 
-        // Find invariants
-        let invariants = findInvariants(in: module)
+        // Find invariants - use explicit list if provided, otherwise use heuristics
+        let invariants = findInvariants(in: module, explicit: explicitInvariants)
 
         // Initialize state space exploration
         var visited: Set<StateHash> = []
@@ -171,7 +332,10 @@ actor ModelChecker {
 
         statistics.statesGenerated = queue.count
 
-        // BFS exploration
+        // BFS exploration - use parallel processing if workers > 1
+        let useParallel = configuration.workers > 1
+        let batchSize = useParallel ? min(configuration.workers * 4, 32) : 1
+
         while !queue.isEmpty && !shouldCancel {
             if statistics.distinctStates >= configuration.maxStates {
                 return VerificationResult(
@@ -184,97 +348,177 @@ actor ModelChecker {
                 )
             }
 
-            let currentState = queue.removeFirst()
-            let currentTrace = trace.removeFirst()
-            statistics.depth = max(statistics.depth, currentTrace.count)
+            if useParallel && queue.count >= batchSize {
+                // Parallel batch processing
+                let batchCount = min(batchSize, queue.count)
+                let batch = Array(queue.prefix(batchCount))
+                let batchTraces = Array(trace.prefix(batchCount))
+                queue.removeFirst(batchCount)
+                trace.removeFirst(batchCount)
 
-            if currentTrace.count > configuration.maxDepth {
-                continue // Skip states beyond max depth
-            }
+                // Capture constant overrides before entering TaskGroup to avoid actor isolation issues
+                let capturedOverrides = constantOverrides
+                let capturedConfig = configuration
 
-            // Check invariants
-            if configuration.checkInvariants {
-                for invariant in invariants {
-                    do {
-                        let holds = try interpreter.evaluateInvariant(invariant, state: currentState, module: module)
-                        if !holds {
-                            // Mark as error state for visualization
-                            errorStateHashes.insert(currentState.hash)
-
-                            return VerificationResult(
-                                specificationName: module.name,
-                                status: .failure,
-                                statesExplored: statistics.statesGenerated,
-                                distinctStates: statistics.distinctStates,
-                                duration: statistics.elapsedTime,
-                                error: "Invariant \(invariant.name) violated",
-                                counterexample: currentTrace.map { state in
-                                    TraceState(variables: state.variables.mapValues { $0.description })
-                                },
-                                explorationResult: getExplorationResult()
+                // Process batch in parallel using TaskGroup
+                let batchResults = await withTaskGroup(of: BatchResult.self, returning: [BatchResult].self) { group in
+                    for (index, state) in batch.enumerated() {
+                        let stateTrace = batchTraces[index]
+                        group.addTask {
+                            // Each task gets its own interpreter to avoid data races
+                            let taskInterpreter = TLAInterpreter()
+                            // Apply constant overrides
+                            for override in capturedOverrides {
+                                taskInterpreter.setConstant(name: override.name, valueString: override.value)
+                            }
+                            return await self.processState(
+                                state,
+                                trace: stateTrace,
+                                module: module,
+                                nextDef: nextDef,
+                                invariants: invariants,
+                                interpreter: taskInterpreter,
+                                configuration: capturedConfig
                             )
                         }
-                    } catch {
+                    }
+
+                    var results: [BatchResult] = []
+                    for await result in group {
+                        results.append(result)
+                    }
+                    return results
+                }
+
+                // Process batch results
+                for result in batchResults {
+                    if let error = result.error {
+                        return error
+                    }
+
+                    statistics.depth = max(statistics.depth, result.depth)
+
+                    for (successor, successorTrace) in zip(result.successors, result.successorTraces) {
+                        statistics.statesGenerated += 1
+                        let hash = successor.hash
+
+                        // Track transition for visualization
+                        stateTransitions.append(StateTransition(
+                            fromHash: result.fromHash,
+                            toHash: hash,
+                            action: nil
+                        ))
+
+                        if !visited.contains(hash) {
+                            visited.insert(hash)
+                            queue.append(successor)
+                            trace.append(successorTrace)
+                            statistics.distinctStates += 1
+
+                            // Track state for visualization
+                            stateHashToIndex[hash] = exploredStates.count
+                            exploredStates.append(successor)
+                        }
+                    }
+
+                    if result.isDeadlock {
+                        errorStateHashes.insert(result.fromHash)
+                    }
+                }
+            } else {
+                // Sequential processing for small queues or single worker
+                let currentState = queue.removeFirst()
+                let currentTrace = trace.removeFirst()
+                statistics.depth = max(statistics.depth, currentTrace.count)
+
+                if currentTrace.count > configuration.maxDepth {
+                    continue // Skip states beyond max depth
+                }
+
+                // Check invariants
+                if configuration.checkInvariants {
+                    for invariant in invariants {
+                        do {
+                            let holds = try interpreter.evaluateInvariant(invariant, state: currentState, module: module)
+                            if !holds {
+                                // Mark as error state for visualization
+                                errorStateHashes.insert(currentState.hash)
+
+                                return VerificationResult(
+                                    specificationName: module.name,
+                                    status: .failure,
+                                    statesExplored: statistics.statesGenerated,
+                                    distinctStates: statistics.distinctStates,
+                                    duration: statistics.elapsedTime,
+                                    error: "Invariant \(invariant.name) violated",
+                                    counterexample: currentTrace.map { state in
+                                        TraceState(variables: state.variables.mapValues { $0.description })
+                                    },
+                                    explorationResult: getExplorationResult()
+                                )
+                            }
+                        } catch {
+                            return VerificationResult(
+                                specificationName: module.name,
+                                status: .error,
+                                error: "Error checking invariant \(invariant.name): \(error)"
+                            )
+                        }
+                    }
+                }
+
+                // Generate successor states
+                do {
+                    let successors = try interpreter.evaluateNext(nextDef, state: currentState, module: module)
+                    let currentHash = currentState.hash
+
+                    if successors.isEmpty && configuration.checkDeadlock {
+                        // Mark as error state for visualization
+                        errorStateHashes.insert(currentHash)
+
                         return VerificationResult(
                             specificationName: module.name,
-                            status: .error,
-                            error: "Error checking invariant \(invariant.name): \(error)"
+                            status: .failure,
+                            statesExplored: statistics.statesGenerated,
+                            distinctStates: statistics.distinctStates,
+                            duration: statistics.elapsedTime,
+                            error: "Deadlock detected",
+                            counterexample: currentTrace.map { state in
+                                TraceState(variables: state.variables.mapValues { $0.description })
+                            },
+                            explorationResult: getExplorationResult()
                         )
                     }
-                }
-            }
 
-            // Generate successor states
-            do {
-                let successors = try interpreter.evaluateNext(nextDef, state: currentState, module: module)
-                let currentHash = currentState.hash
+                    for successor in successors {
+                        statistics.statesGenerated += 1
+                        let hash = successor.hash
 
-                if successors.isEmpty && configuration.checkDeadlock {
-                    // Mark as error state for visualization
-                    errorStateHashes.insert(currentHash)
+                        // Track transition for visualization
+                        stateTransitions.append(StateTransition(
+                            fromHash: currentHash,
+                            toHash: hash,
+                            action: nil
+                        ))
 
+                        if !visited.contains(hash) {
+                            visited.insert(hash)
+                            queue.append(successor)
+                            trace.append(currentTrace + [successor])
+                            statistics.distinctStates += 1
+
+                            // Track state for visualization
+                            stateHashToIndex[hash] = exploredStates.count
+                            exploredStates.append(successor)
+                        }
+                    }
+                } catch {
                     return VerificationResult(
                         specificationName: module.name,
-                        status: .failure,
-                        statesExplored: statistics.statesGenerated,
-                        distinctStates: statistics.distinctStates,
-                        duration: statistics.elapsedTime,
-                        error: "Deadlock detected",
-                        counterexample: currentTrace.map { state in
-                            TraceState(variables: state.variables.mapValues { $0.description })
-                        },
-                        explorationResult: getExplorationResult()
+                        status: .error,
+                        error: "Error evaluating Next: \(error)"
                     )
                 }
-
-                for successor in successors {
-                    statistics.statesGenerated += 1
-                    let hash = successor.hash
-
-                    // Track transition for visualization
-                    stateTransitions.append(StateTransition(
-                        fromHash: currentHash,
-                        toHash: hash,
-                        action: nil
-                    ))
-
-                    if !visited.contains(hash) {
-                        visited.insert(hash)
-                        queue.append(successor)
-                        trace.append(currentTrace + [successor])
-                        statistics.distinctStates += 1
-
-                        // Track state for visualization
-                        stateHashToIndex[hash] = exploredStates.count
-                        exploredStates.append(successor)
-                    }
-                }
-            } catch {
-                return VerificationResult(
-                    specificationName: module.name,
-                    status: .error,
-                    error: "Error evaluating Next: \(error)"
-                )
             }
 
             // Yield to allow cancellation
@@ -294,6 +538,45 @@ actor ModelChecker {
             )
         }
 
+        // Check temporal properties (liveness) after BFS completes
+        if configuration.checkLiveness {
+            let temporalProperties = findTemporalProperties(in: module, explicit: explicitProperties)
+
+            if !temporalProperties.isEmpty {
+                let temporalResults = await checkTemporalProperties(
+                    temporalProperties,
+                    module: module,
+                    interpreter: interpreter
+                )
+
+                // Check for violations
+                for result in temporalResults where !result.holds {
+                    // Mark error states for visualization
+                    if let counterexample = result.counterexample, let lastState = counterexample.last {
+                        errorStateHashes.insert(lastState.hash)
+                    }
+
+                    return VerificationResult(
+                        specificationName: module.name,
+                        status: .failure,
+                        statesExplored: statistics.statesGenerated,
+                        distinctStates: statistics.distinctStates,
+                        duration: statistics.elapsedTime,
+                        error: "Temporal property violated: \(describeProperty(result.property))",
+                        counterexample: result.counterexample?.enumerated().map { index, state in
+                            TraceState(
+                                stepNumber: index,
+                                action: index == result.loopStart ? "← Loop starts here" : "",
+                                state: state.variables.mapValues { $0.description },
+                                isError: index == (result.counterexample?.count ?? 0) - 1
+                            )
+                        } ?? [],
+                        explorationResult: getExplorationResult()
+                    )
+                }
+            }
+        }
+
         return VerificationResult(
             specificationName: module.name,
             status: .success,
@@ -309,6 +592,19 @@ actor ModelChecker {
             """,
             explorationResult: getExplorationResult()
         )
+    }
+
+    /// Helper to describe a temporal property for error messages
+    private func describeProperty(_ property: TemporalProperty) -> String {
+        switch property {
+        case .always(let p): return "[](\(p))"
+        case .eventually(let p): return "<>(\(p))"
+        case .alwaysEventually(let p): return "[]<>(\(p))"
+        case .eventuallyAlways(let p): return "<>[](\(p))"
+        case .leadsto(let p, let q): return "\(p) ~> \(q)"
+        case .weakFairness(let a): return "WF(\(a))"
+        case .strongFairness(let a): return "SF(\(a))"
+        }
     }
 
     private func getExplorationResult() -> ExplorationResult {
@@ -829,9 +1125,63 @@ actor ModelChecker {
     }
 
     /// Find temporal properties defined in the module
-    private func findTemporalProperties(in module: TLAModule) -> [TemporalProperty] {
+    private func findTemporalProperties(in module: TLAModule, explicit: [PropertySpec] = []) -> [TemporalProperty] {
         var properties: [TemporalProperty] = []
 
+        // If explicit properties provided, convert them to TemporalProperty
+        if !explicit.isEmpty {
+            for spec in explicit {
+                // Try to parse the property name/expression
+                // Common patterns: Liveness, Termination, []<>P, P ~> Q
+                let name = spec.name
+                if name.contains("~>") {
+                    // Leads-to: P ~> Q
+                    let parts = name.components(separatedBy: "~>")
+                    if parts.count == 2 {
+                        properties.append(.leadsto(parts[0].trimmingCharacters(in: .whitespaces),
+                                                   parts[1].trimmingCharacters(in: .whitespaces)))
+                    }
+                } else if name.hasPrefix("[]<>") || name.hasPrefix("[]<>") {
+                    // Always eventually: []<>P
+                    let predicate = name.replacingOccurrences(of: "[]<>", with: "").trimmingCharacters(in: .whitespaces)
+                    properties.append(.alwaysEventually(predicate.isEmpty ? name : predicate))
+                } else if name.hasPrefix("<>[]") {
+                    // Eventually always: <>[]P
+                    let predicate = name.replacingOccurrences(of: "<>[]", with: "").trimmingCharacters(in: .whitespaces)
+                    properties.append(.eventuallyAlways(predicate.isEmpty ? name : predicate))
+                } else if name.hasPrefix("<>") {
+                    // Eventually: <>P
+                    let predicate = name.replacingOccurrences(of: "<>", with: "").trimmingCharacters(in: .whitespaces)
+                    properties.append(.eventually(predicate.isEmpty ? name : predicate))
+                } else if name.hasPrefix("[]") {
+                    // Always: []P (usually handled as invariant, but support it)
+                    let predicate = name.replacingOccurrences(of: "[]", with: "").trimmingCharacters(in: .whitespaces)
+                    properties.append(.always(predicate.isEmpty ? name : predicate))
+                } else if name.hasPrefix("WF_") || name.hasPrefix("WF(") {
+                    // Weak fairness
+                    let action = name.replacingOccurrences(of: "WF_", with: "")
+                        .replacingOccurrences(of: "WF(", with: "")
+                        .replacingOccurrences(of: ")", with: "")
+                    properties.append(.weakFairness(action))
+                } else if name.hasPrefix("SF_") || name.hasPrefix("SF(") {
+                    // Strong fairness
+                    let action = name.replacingOccurrences(of: "SF_", with: "")
+                        .replacingOccurrences(of: "SF(", with: "")
+                        .replacingOccurrences(of: ")", with: "")
+                    properties.append(.strongFairness(action))
+                } else {
+                    // Assume it's an operator name, try to find and analyze it
+                    if let op = findOperator(named: name, in: module) {
+                        if let propName = extractPropertyName(from: op) {
+                            properties.append(.alwaysEventually(propName))
+                        }
+                    }
+                }
+            }
+            return properties
+        }
+
+        // Otherwise, use heuristics to find temporal properties by naming pattern
         for decl in module.declarations {
             if case .operatorDef(let def) = decl {
                 // Look for common patterns
@@ -868,10 +1218,20 @@ actor ModelChecker {
         return nil
     }
 
-    private func findInvariants(in module: TLAModule) -> [OperatorDefinition] {
-        // In a real implementation, invariants would be specified in a config file
-        // For now, look for operators with common invariant naming patterns
+    private func findInvariants(in module: TLAModule, explicit: [InvariantSpec] = []) -> [OperatorDefinition] {
         var invariants: [OperatorDefinition] = []
+
+        // If explicit invariants provided, use those
+        if !explicit.isEmpty {
+            for spec in explicit {
+                if let op = findOperator(named: spec.name, in: module) {
+                    invariants.append(op)
+                }
+            }
+            return invariants
+        }
+
+        // Otherwise, use heuristics to find invariants by naming pattern
         for decl in module.declarations {
             if case .operatorDef(let def) = decl {
                 let name = def.name

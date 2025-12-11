@@ -567,8 +567,13 @@ final class PlusCalTranslator {
             }
         }
 
-        // Generate variable list
+        // Add stack variable if there are procedures
+        let hasProcedures = !algorithm.procedures.isEmpty
         var allVars = algorithm.variables.map(\.name) + localVars + ["pc"]
+        if hasProcedures {
+            allVars.append("stack")
+        }
+
         if algorithm.processes.count > 1 {
             // For multiple processes, need ProcSet
             output += "ProcSet == {"
@@ -586,6 +591,14 @@ final class PlusCalTranslator {
         }
         for variable in localVars {
             output += "    /\\ \(variable) = {}\n" // Default initialization
+        }
+        // Initialize stack if we have procedures
+        if hasProcedures {
+            if algorithm.processes.count > 1 {
+                output += "    /\\ stack = [self \\in ProcSet |-> <<>>]\n"
+            } else {
+                output += "    /\\ stack = <<>>\n"
+            }
         }
 
         // Initialize pc
@@ -651,9 +664,103 @@ final class PlusCalTranslator {
         // Generate procedure actions
         for procedure in algorithm.procedures {
             output += "\\* Procedure \(procedure.name)\n"
-            output += "\(procedure.name)Action ==\n"
-            output += "    /\\ TRUE \\* Procedure body\n"
-            output += "    /\\ UNCHANGED vars\n\n"
+
+            // Generate action for procedure entry
+            output += "\(procedure.name)_startAction ==\n"
+            if algorithm.processes.count > 1 {
+                output += "    /\\ pc[self] = \"\(procedure.name)_start\"\n"
+            } else {
+                output += "    /\\ pc = \"\(procedure.name)_start\"\n"
+            }
+
+            // Generate actions for procedure body labels
+            let labels = extractLabels(from: procedure.body)
+            if labels.isEmpty {
+                // No labels - just execute body and return
+                var modifiedVars: Set<String> = []
+                for stmt in procedure.body {
+                    if case .assignment(let v, let e) = stmt {
+                        output += "    /\\ \(v)' = \(e)\n"
+                        modifiedVars.insert(v)
+                    }
+                }
+
+                // Return via stack
+                if algorithm.processes.count > 1 {
+                    output += "    /\\ stack[self] # <<>>\n"
+                    output += "    /\\ pc' = [pc EXCEPT ![self] = Head(stack[self])[2]]\n"
+                    output += "    /\\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]\n"
+                } else {
+                    output += "    /\\ stack # <<>>\n"
+                    output += "    /\\ pc' = Head(stack)[2]\n"
+                    output += "    /\\ stack' = Tail(stack)\n"
+                }
+                let unchangedVars = allVars.filter { $0 != "pc" && $0 != "stack" && !modifiedVars.contains($0) }
+                if !unchangedVars.isEmpty {
+                    output += "    /\\ UNCHANGED <<\(unchangedVars.joined(separator: ", "))>>\n"
+                }
+            } else {
+                // Has labels - set pc to first label
+                let firstLabel = labels[0]
+                if algorithm.processes.count > 1 {
+                    output += "    /\\ pc' = [pc EXCEPT ![self] = \"\(firstLabel)\"]\n"
+                } else {
+                    output += "    /\\ pc' = \"\(firstLabel)\"\n"
+                }
+                let unchangedVars = allVars.filter { $0 != "pc" }
+                if !unchangedVars.isEmpty {
+                    output += "    /\\ UNCHANGED <<\(unchangedVars.joined(separator: ", "))>>\n"
+                }
+
+                // Generate action for each label in procedure
+                for stmt in procedure.body {
+                    if case .labeled(let label, let stmts) = stmt {
+                        output += "\n\(label)Action ==\n"
+                        if algorithm.processes.count > 1 {
+                            output += "    /\\ pc[self] = \"\(label)\"\n"
+                        } else {
+                            output += "    /\\ pc = \"\(label)\"\n"
+                        }
+
+                        var labelModified: Set<String> = []
+                        for s in stmts {
+                            if case .assignment(let v, let e) = s {
+                                output += "    /\\ \(v)' = \(e)\n"
+                                labelModified.insert(v)
+                            }
+                        }
+
+                        // Find next label or return
+                        let currentIdx = labels.firstIndex(of: label) ?? 0
+                        if currentIdx + 1 < labels.count {
+                            let nextLabel = labels[currentIdx + 1]
+                            if algorithm.processes.count > 1 {
+                                output += "    /\\ pc' = [pc EXCEPT ![self] = \"\(nextLabel)\"]\n"
+                            } else {
+                                output += "    /\\ pc' = \"\(nextLabel)\"\n"
+                            }
+                        } else {
+                            // Last label - return
+                            if algorithm.processes.count > 1 {
+                                output += "    /\\ stack[self] # <<>>\n"
+                                output += "    /\\ pc' = [pc EXCEPT ![self] = Head(stack[self])[2]]\n"
+                                output += "    /\\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]\n"
+                            } else {
+                                output += "    /\\ stack # <<>>\n"
+                                output += "    /\\ pc' = Head(stack)[2]\n"
+                                output += "    /\\ stack' = Tail(stack)\n"
+                            }
+                            labelModified.insert("stack")
+                        }
+
+                        let unchangedInLabel = allVars.filter { $0 != "pc" && !labelModified.contains($0) }
+                        if !unchangedInLabel.isEmpty {
+                            output += "    /\\ UNCHANGED <<\(unchangedInLabel.joined(separator: ", "))>>\n"
+                        }
+                    }
+                }
+            }
+            output += "\n"
         }
 
         // Generate Next
@@ -687,13 +794,38 @@ final class PlusCalTranslator {
         }
         output += "\n"
 
-        // Generate Spec
+        // Generate Spec with fairness
+        output += "Spec == Init /\\ [][Next]_vars"
+
+        // Add fairness constraints
+        var fairnessConstraints: [String] = []
+
+        // Algorithm-level fairness
         if algorithm.isFair {
-            output += "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next)\n"
-        } else {
-            output += "Spec == Init /\\ [][Next]_vars\n"
+            fairnessConstraints.append("WF_vars(Next)")
         }
-        output += "\n"
+
+        // Process-level fairness
+        for process in algorithm.processes {
+            if process.isFair {
+                // Get all actions for this process
+                let labels = extractLabels(from: process.body)
+                if labels.isEmpty {
+                    // Single action process
+                    fairnessConstraints.append("WF_vars(\(process.name)Action)")
+                } else {
+                    // Multiple actions - add fairness for each
+                    for label in labels {
+                        fairnessConstraints.append("WF_vars(\(label)Action)")
+                    }
+                }
+            }
+        }
+
+        if !fairnessConstraints.isEmpty {
+            output += "\n    /\\ " + fairnessConstraints.joined(separator: "\n    /\\ ")
+        }
+        output += "\n\n"
 
         // Generate Termination
         if !algorithm.processes.isEmpty {
@@ -760,8 +892,24 @@ final class PlusCalTranslator {
             case .while(let condition, _):
                 output += "    /\\ \(condition) \\* While condition\n"
 
-            case .with(let variable, let setExpr, _):
+            case .with(let variable, let setExpr, let body):
+                // Generate existential quantification with body
                 output += "    /\\ \\E \(variable) \\in \(setExpr):\n"
+                if body.isEmpty {
+                    output += "        TRUE\n"
+                } else {
+                    output += "        ("
+                    // Generate body statements as conjunction
+                    var bodyParts: [String] = []
+                    for bodyStmt in body {
+                        if case .assignment(let v, let e) = bodyStmt {
+                            bodyParts.append("\(v)' = \(e)")
+                            modifiedVars.insert(v)
+                        }
+                    }
+                    output += bodyParts.joined(separator: " /\\ ")
+                    output += ")\n"
+                }
 
             case .goto(let targetLabel):
                 // Override next label for goto
@@ -773,7 +921,49 @@ final class PlusCalTranslator {
                 output += "    /\\ UNCHANGED <<\(allVars.filter { $0 != "pc" && !modifiedVars.contains($0) }.joined(separator: ", "))>>\n\n"
                 return output
 
-            case .skip, .return, .print, .call, .either, .labeled:
+            case .call(let procedure, let arguments):
+                // Generate procedure call with stack push
+                let returnLabel = nextLabel
+                if algorithm.processes.count > 1 {
+                    output += "    /\\ stack' = [stack EXCEPT ![self] = Append(stack[self], <<pc[self], \"\(returnLabel)\">>)]\n"
+                    output += "    /\\ pc' = [pc EXCEPT ![self] = \"\(procedure)_start\"]\n"
+                } else {
+                    output += "    /\\ stack' = Append(stack, <<pc, \"\(returnLabel)\">>)\n"
+                    output += "    /\\ pc' = \"\(procedure)_start\"\n"
+                }
+                // Store arguments if any
+                for (i, arg) in arguments.enumerated() {
+                    if i < algorithm.procedures.first(where: { $0.name == procedure })?.parameters.count ?? 0 {
+                        let param = algorithm.procedures.first(where: { $0.name == procedure })?.parameters[i] ?? "arg\(i)"
+                        output += "    /\\ \(param)' = \(arg)\n"
+                        modifiedVars.insert(param)
+                    }
+                }
+                modifiedVars.insert("stack")
+                // Don't continue with normal pc update - call handles it
+                output += "    /\\ UNCHANGED <<\(allVars.filter { $0 != "pc" && $0 != "stack" && !modifiedVars.contains($0) }.joined(separator: ", "))>>\n\n"
+                return output
+
+            case .return:
+                // Generate return with stack pop
+                if algorithm.processes.count > 1 {
+                    output += "    /\\ stack[self] # <<>>\n"
+                    output += "    /\\ pc' = [pc EXCEPT ![self] = Head(stack[self])[2]]\n"
+                    output += "    /\\ stack' = [stack EXCEPT ![self] = Tail(stack[self])]\n"
+                } else {
+                    output += "    /\\ stack # <<>>\n"
+                    output += "    /\\ pc' = Head(stack)[2]\n"
+                    output += "    /\\ stack' = Tail(stack)\n"
+                }
+                modifiedVars.insert("stack")
+                output += "    /\\ UNCHANGED <<\(allVars.filter { $0 != "pc" && $0 != "stack" && !modifiedVars.contains($0) }.joined(separator: ", "))>>\n\n"
+                return output
+
+            case .print(let expression):
+                // Print is a side effect - just document it
+                output += "    \\* Print: \(expression)\n"
+
+            case .skip, .either, .labeled:
                 break
             }
         }
