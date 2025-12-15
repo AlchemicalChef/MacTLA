@@ -10,6 +10,7 @@ final class FileStorage: ObservableObject {
     @Published var isSyncing = false
     @Published var recentFiles: [RecentFile] = []
     @Published var lastAutoSaveError: String?
+    @Published var lastFileError: String?
 
     private let fileManager = FileManager.default
 
@@ -27,7 +28,11 @@ final class FileStorage: ObservableObject {
 
     private var projectsDirectory: URL {
         let url = (cloudDocumentsURL ?? localDocumentsURL).appendingPathComponent("Projects")
-        try? fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+        do {
+            try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
+        } catch {
+            lastFileError = "Failed to create projects directory: \(error.localizedDescription)"
+        }
         return url
     }
 
@@ -90,13 +95,24 @@ final class FileStorage: ObservableObject {
     }
 
     private func saveRecentFiles() {
-        guard let data = try? JSONEncoder().encode(recentFiles) else { return }
-        try? data.write(to: recentFilesURL)
+        do {
+            let data = try JSONEncoder().encode(recentFiles)
+            try data.write(to: recentFilesURL)
+        } catch {
+            lastFileError = "Failed to save recent files: \(error.localizedDescription)"
+        }
     }
 
     func clearRecentFiles() {
         recentFiles = []
-        try? fileManager.removeItem(at: recentFilesURL)
+        do {
+            try fileManager.removeItem(at: recentFilesURL)
+        } catch {
+            // It's OK if the file doesn't exist, but log other errors
+            if (error as NSError).code != NSFileNoSuchFileError {
+                lastFileError = "Failed to clear recent files: \(error.localizedDescription)"
+            }
+        }
     }
 
     // MARK: - Project Operations

@@ -229,6 +229,9 @@ struct TraceSheetView: View {
     let result: VerificationResult
 
     @State private var selectedStateIndex = 0
+    @State private var expressionText = ""
+    @State private var evaluatedExpressions: [UUID: String] = [:]  // State ID -> evaluation result
+    @State private var evaluationError: String?
 
     private var trace: [TraceState] {
         // The counterexample is the trace - use it directly
@@ -302,6 +305,60 @@ struct TraceSheetView: View {
                                 }
                             }
 
+                            Divider()
+
+                            // Expression Evaluation Section
+                            VStack(alignment: .leading, spacing: 8) {
+                                Label("Evaluate Expression", systemImage: "function")
+                                    .font(.headline)
+
+                                HStack {
+                                    TextField("Enter expression (e.g., x + y)", text: $expressionText)
+                                        .textFieldStyle(.roundedBorder)
+                                        .font(.system(.body, design: .monospaced))
+                                        .onSubmit {
+                                            evaluateExpressionForAllStates()
+                                        }
+
+                                    Button("Evaluate") {
+                                        evaluateExpressionForAllStates()
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(expressionText.isEmpty)
+
+                                    if !evaluatedExpressions.isEmpty {
+                                        Button("Clear") {
+                                            evaluatedExpressions.removeAll()
+                                            evaluationError = nil
+                                        }
+                                        .buttonStyle(.bordered)
+                                    }
+                                }
+
+                                if let error = evaluationError {
+                                    Text(error)
+                                        .font(.caption)
+                                        .foregroundStyle(.red)
+                                }
+
+                                if let evalResult = evaluatedExpressions[currentState.id] {
+                                    HStack {
+                                        Text("Result:")
+                                            .font(.subheadline)
+                                            .foregroundStyle(.secondary)
+                                        Text(evalResult)
+                                            .font(.system(.body, design: .monospaced))
+                                            .foregroundStyle(.green)
+                                            .textSelection(.enabled)
+                                    }
+                                    .padding()
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .fill(Color.green.opacity(0.1))
+                                    )
+                                }
+                            }
+
                             Spacer()
                         }
                         .padding()
@@ -348,6 +405,137 @@ struct TraceSheetView: View {
         if selectedStateIndex < trace.count - 1 {
             selectedStateIndex += 1
         }
+    }
+
+    /// Evaluates the expression for all states in the trace
+    private func evaluateExpressionForAllStates() {
+        guard !expressionText.isEmpty else { return }
+
+        evaluatedExpressions.removeAll()
+        evaluationError = nil
+
+        let parser = TLAParser()
+        let interpreter = TLAInterpreter()
+
+        // Parse the expression once
+        guard case .success(let expr) = parser.parseExpression(expressionText) else {
+            evaluationError = "Failed to parse expression"
+            return
+        }
+
+        // Evaluate for each state
+        for state in trace {
+            var env = TLAInterpreter.Environment()
+
+            // Set up variables from the state
+            for (key, valueStr) in state.variables {
+                if let value = parseValueString(valueStr) {
+                    env.variables[key] = value
+                }
+            }
+
+            do {
+                let result = try interpreter.evaluate(expr, in: env)
+                evaluatedExpressions[state.id] = result.description
+            } catch {
+                evaluatedExpressions[state.id] = "Error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Parse a string representation back to a TLAValue
+    private func parseValueString(_ str: String) -> TLAValue? {
+        let trimmed = str.trimmingCharacters(in: .whitespaces)
+
+        // Boolean
+        if trimmed == "TRUE" { return .boolean(true) }
+        if trimmed == "FALSE" { return .boolean(false) }
+
+        // Integer
+        if let n = Int(trimmed) { return .integer(n) }
+
+        // String (quoted)
+        if trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"") {
+            return .string(String(trimmed.dropFirst().dropLast()))
+        }
+
+        // Set: {a, b, c}
+        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
+            let inner = String(trimmed.dropFirst().dropLast())
+            if inner.isEmpty { return .set([]) }
+            let elements = parseCommaSeparated(inner)
+            var values: Set<TLAValue> = []
+            for elem in elements {
+                if let val = parseValueString(elem) {
+                    values.insert(val)
+                }
+            }
+            return .set(values)
+        }
+
+        // Sequence: <<a, b, c>>
+        if trimmed.hasPrefix("<<") && trimmed.hasSuffix(">>") {
+            let inner = String(trimmed.dropFirst(2).dropLast(2))
+            if inner.isEmpty { return .sequence([]) }
+            let elements = parseCommaSeparated(inner)
+            var values: [TLAValue] = []
+            for elem in elements {
+                if let val = parseValueString(elem) {
+                    values.append(val)
+                }
+            }
+            return .sequence(values)
+        }
+
+        // Record: [a |-> 1, b |-> 2]
+        if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") {
+            let inner = String(trimmed.dropFirst().dropLast())
+            if inner.isEmpty { return .record([:]) }
+            let fields = parseCommaSeparated(inner)
+            var record: [String: TLAValue] = [:]
+            for field in fields {
+                let parts = field.components(separatedBy: "|->")
+                if parts.count == 2 {
+                    let key = parts[0].trimmingCharacters(in: .whitespaces)
+                    let valStr = parts[1].trimmingCharacters(in: .whitespaces)
+                    if let val = parseValueString(valStr) {
+                        record[key] = val
+                    }
+                }
+            }
+            return .record(record)
+        }
+
+        // Default: model value
+        return .modelValue(trimmed)
+    }
+
+    /// Parse comma-separated elements, respecting nesting
+    private func parseCommaSeparated(_ str: String) -> [String] {
+        var elements: [String] = []
+        var current = ""
+        var depth = 0
+
+        for char in str {
+            if char == "{" || char == "[" || char == "<" {
+                depth += 1
+                current.append(char)
+            } else if char == "}" || char == "]" || char == ">" {
+                depth -= 1
+                current.append(char)
+            } else if char == "," && depth == 0 {
+                elements.append(current.trimmingCharacters(in: .whitespaces))
+                current = ""
+            } else {
+                current.append(char)
+            }
+        }
+
+        if !current.isEmpty {
+            elements.append(current.trimmingCharacters(in: .whitespaces))
+        }
+
+        return elements
     }
 }
 

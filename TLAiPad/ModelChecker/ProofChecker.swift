@@ -394,14 +394,7 @@ actor ProofChecker {
         }
 
         // Try to evaluate the goal with facts as context
-        var env = TLAInterpreter.Environment()
-
-        // Add definitions from module
-        for decl in module.declarations {
-            if case .operatorDef(let def) = decl {
-                env.operators[def.name] = def
-            }
-        }
+        let env = TLAInterpreter.Environment.from(module: module)
 
         // Try to evaluate the goal
         do {
@@ -425,12 +418,7 @@ actor ProofChecker {
         // etc.
 
         // For now, just try to evaluate
-        var env = TLAInterpreter.Environment()
-        for decl in module.declarations {
-            if case .operatorDef(let def) = decl {
-                env.operators[def.name] = def
-            }
-        }
+        let env = TLAInterpreter.Environment.from(module: module)
 
         do {
             let result = try interpreter.evaluate(obligation.goal, in: env)

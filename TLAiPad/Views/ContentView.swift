@@ -185,6 +185,21 @@ struct ContentView: View {
         .documentImporter(isPresented: $documentManager.isImporting) { urls in
             documentManager.importFiles(from: urls, into: appState)
         }
+        .fileExporter(
+            isPresented: $documentManager.isExporting,
+            document: TLADocument(content: documentManager.exportFile?.content ?? ""),
+            contentType: .plainText,
+            defaultFilename: documentManager.exportFile?.name ?? "Spec.tla"
+        ) { result in
+            switch result {
+            case .success(let url):
+                print("Exported to: \(url)")
+            case .failure(let error):
+                documentManager.errorMessage = error.localizedDescription
+                documentManager.showError = true
+            }
+            documentManager.exportFile = nil
+        }
         #endif
         .alert("Error", isPresented: $documentManager.showError) {
             Button("OK", role: .cancel) {}
@@ -239,7 +254,10 @@ struct ContentView: View {
                 checkDeadlock: config.checkDeadlock,
                 checkInvariants: true,
                 checkProperties: !config.properties.isEmpty,
-                checkLiveness: !config.properties.isEmpty || config.properties.isEmpty // Check liveness by default
+                checkLiveness: !config.properties.isEmpty || config.properties.isEmpty, // Check liveness by default
+                simulationMode: config.simulationMode,
+                simulationTraceCount: config.simulationTraceCount,
+                simulationTraceDepth: config.simulationTraceDepth
             )
 
             // Convert constants
@@ -257,13 +275,35 @@ struct ContentView: View {
                 ModelChecker.PropertySpec(name: $0.name)
             }
 
+            // Convert state constraints
+            let constraints = config.constraints.filter { !$0.expression.isEmpty }.map {
+                ModelChecker.ConstraintSpec(expression: $0.expression)
+            }
+
+            // Convert action constraints
+            let actionConstraints = config.actionConstraints.filter { !$0.expression.isEmpty }.map {
+                ModelChecker.ActionConstraintSpec(expression: $0.expression)
+            }
+
+            // Convert view
+            let view: ModelChecker.ViewSpec? = config.view.isEmpty ? nil : ModelChecker.ViewSpec(expression: config.view)
+
+            // Convert symmetry sets
+            let symmetrySets = config.symmetrySets.filter { !$0.name.isEmpty }.map {
+                ModelChecker.SymmetrySetSpec(name: $0.name)
+            }
+
             let checker = ModelChecker()
             let result = await checker.verify(
                 specification: file.content,
                 config: checkerConfig,
                 constants: constants,
                 invariants: invariants,
-                properties: properties
+                properties: properties,
+                constraints: constraints,
+                actionConstraints: actionConstraints,
+                view: view,
+                symmetrySets: symmetrySets
             )
             appState.verificationResults.append(result)
 
@@ -282,13 +322,13 @@ struct ContentView: View {
 
         // Check in current project's files
         if let project = appState.currentProject {
-            if let cfgFile = project.files.first(where: { $0.name == cfgFileName && $0.type == .config }) {
+            if let cfgFile = project.files.first(where: { $0.name == cfgFileName && $0.type == .model }) {
                 return TLCConfig.parse(from: cfgFile.content)
             }
         }
 
         // Check in open files
-        if let cfgFile = appState.openFiles.first(where: { $0.name == cfgFileName && $0.type == .config }) {
+        if let cfgFile = appState.openFiles.first(where: { $0.name == cfgFileName && $0.type == .model }) {
             return TLCConfig.parse(from: cfgFile.content)
         }
 

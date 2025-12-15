@@ -367,6 +367,100 @@ final class SymbolNavigator {
 
         return references
     }
+
+    // MARK: - Rename Symbol
+
+    /// Renames all occurrences of a symbol in the source code
+    func renameSymbol(from oldName: String, to newName: String, in source: String) -> (newSource: String, changesCount: Int) {
+        let references = findReferences(to: oldName, in: source)
+        guard !references.isEmpty else {
+            return (source, 0)
+        }
+
+        // Sort references by position (reverse order) to replace from end to start
+        // This preserves line/column positions during replacement
+        let sortedRefs = references.sorted { ref1, ref2 in
+            if ref1.line != ref2.line {
+                return ref1.line > ref2.line
+            }
+            return ref1.column > ref2.column
+        }
+
+        var lines = source.components(separatedBy: "\n")
+        var changesCount = 0
+
+        for ref in sortedRefs {
+            let lineIndex = ref.line - 1
+            guard lineIndex >= 0 && lineIndex < lines.count else { continue }
+
+            var line = lines[lineIndex]
+            let startIndex = line.index(line.startIndex, offsetBy: ref.column - 1, limitedBy: line.endIndex) ?? line.endIndex
+            let endIndex = line.index(startIndex, offsetBy: ref.length, limitedBy: line.endIndex) ?? line.endIndex
+
+            // Verify the text at this location matches
+            let existingText = String(line[startIndex..<endIndex])
+            if existingText == oldName {
+                line.replaceSubrange(startIndex..<endIndex, with: newName)
+                lines[lineIndex] = line
+                changesCount += 1
+            }
+        }
+
+        return (lines.joined(separator: "\n"), changesCount)
+    }
+
+    /// Validates if a rename is safe (new name is a valid identifier and doesn't conflict)
+    func validateRename(from oldName: String, to newName: String, in source: String) -> RenameValidation {
+        // Check if new name is valid identifier
+        guard !newName.isEmpty,
+              newName.first?.isLetter == true || newName.first == "_",
+              newName.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) else {
+            return .invalid("New name must be a valid identifier")
+        }
+
+        // Check if new name is a keyword
+        let keywords = ["MODULE", "EXTENDS", "CONSTANT", "CONSTANTS", "VARIABLE", "VARIABLES",
+                       "ASSUME", "THEOREM", "INSTANCE", "LOCAL", "LET", "IN", "IF", "THEN",
+                       "ELSE", "CASE", "OTHER", "CHOOSE", "WITH", "EXCEPT", "ENABLED",
+                       "UNCHANGED", "TRUE", "FALSE", "BOOLEAN", "STRING", "SUBSET", "UNION",
+                       "DOMAIN", "SF_", "WF_"]
+        if keywords.contains(newName.uppercased()) {
+            return .invalid("'\(newName)' is a reserved keyword")
+        }
+
+        // Check if new name already exists
+        let existingSymbols = extractSymbols(from: source)
+        if existingSymbols.contains(where: { $0.name == newName && $0.name != oldName }) {
+            return .conflict("A symbol named '\(newName)' already exists")
+        }
+
+        let references = findReferences(to: oldName, in: source)
+        if references.isEmpty {
+            return .invalid("No references to '\(oldName)' found")
+        }
+
+        return .valid(referenceCount: references.count)
+    }
+
+    enum RenameValidation {
+        case valid(referenceCount: Int)
+        case invalid(String)
+        case conflict(String)
+
+        var isValid: Bool {
+            if case .valid = self { return true }
+            return false
+        }
+
+        var message: String? {
+            switch self {
+            case .valid(let count):
+                return "Will rename \(count) occurrence\(count == 1 ? "" : "s")"
+            case .invalid(let msg), .conflict(let msg):
+                return msg
+            }
+        }
+    }
 }
 
 // MARK: - Symbol List View
@@ -505,6 +599,174 @@ struct SymbolRowView: View {
                 .foregroundStyle(.tertiary)
         }
         .padding(.vertical, 4)
+    }
+}
+
+// MARK: - References View
+
+/// View showing all references to a symbol
+struct ReferencesView: View {
+    let symbolName: String
+    let references: [SourceLocation]
+    let source: String
+    let onSelect: (SourceLocation) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Header
+            HStack {
+                Label(
+                    "\(references.count) reference\(references.count == 1 ? "" : "s") to '\(symbolName)'",
+                    systemImage: "link"
+                )
+                .font(.headline)
+
+                Spacer()
+            }
+            .padding()
+            .background(.bar)
+
+            Divider()
+
+            // References list
+            List {
+                ForEach(references.indices, id: \.self) { index in
+                    let ref = references[index]
+                    ReferenceRow(
+                        location: ref,
+                        lineContent: getLineContent(at: ref.line),
+                        onSelect: { onSelect(ref) }
+                    )
+                }
+            }
+            .listStyle(.plain)
+        }
+    }
+
+    private func getLineContent(at lineNumber: Int) -> String {
+        let lines = source.components(separatedBy: "\n")
+        guard lineNumber > 0 && lineNumber <= lines.count else {
+            return ""
+        }
+        return lines[lineNumber - 1].trimmingCharacters(in: .whitespaces)
+    }
+}
+
+struct ReferenceRow: View {
+    let location: SourceLocation
+    let lineContent: String
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(alignment: .top, spacing: 12) {
+                // Line number
+                Text("L\(location.line)")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 40, alignment: .trailing)
+
+                // Line content
+                Text(lineContent)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Rename Dialog View
+
+/// Dialog for renaming a symbol
+struct RenameSymbolView: View {
+    @Binding var isPresented: Bool
+    let symbolName: String
+    let source: String
+    let onRename: (String, Int) -> Void
+
+    @State private var newName: String = ""
+    @State private var validation: SymbolNavigator.RenameValidation?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Rename Symbol")
+                .font(.headline)
+
+            Text("Rename '\(symbolName)' to:")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            TextField("New name", text: $newName)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+                .onChange(of: newName) { _, _ in
+                    validateNewName()
+                }
+
+            if let validation = validation {
+                HStack {
+                    Image(systemName: validation.isValid ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                        .foregroundStyle(validation.isValid ? .green : .red)
+
+                    Text(validation.message ?? "")
+                        .font(.caption)
+                        .foregroundStyle(validation.isValid ? .secondary : .red)
+                }
+            }
+
+            HStack {
+                Spacer()
+
+                Button("Cancel") {
+                    isPresented = false
+                }
+                .buttonStyle(.bordered)
+
+                Button("Rename") {
+                    performRename()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(validation?.isValid != true)
+            }
+        }
+        .padding()
+        .frame(minWidth: 300)
+        .onAppear {
+            newName = symbolName
+            validateNewName()
+        }
+    }
+
+    private func validateNewName() {
+        if newName == symbolName {
+            validation = nil
+            return
+        }
+        validation = SymbolNavigator.shared.validateRename(
+            from: symbolName,
+            to: newName,
+            in: source
+        )
+    }
+
+    private func performRename() {
+        let result = SymbolNavigator.shared.renameSymbol(
+            from: symbolName,
+            to: newName,
+            in: source
+        )
+        onRename(result.newSource, result.changesCount)
+        isPresented = false
     }
 }
 

@@ -15,6 +15,8 @@ struct VerificationResult: Identifiable {
     let violatedInvariant: String?
     let explorationResult: ModelChecker.ExplorationResult?
     let errorDetails: ErrorDetails?
+    let coverageReport: CoverageReport?
+    let profilingReport: ProfilingReport?
 
     init(
         id: UUID = UUID(),
@@ -29,7 +31,9 @@ struct VerificationResult: Identifiable {
         counterexample: [TraceState] = [],
         violatedInvariant: String? = nil,
         explorationResult: ModelChecker.ExplorationResult? = nil,
-        errorDetails: ErrorDetails? = nil
+        errorDetails: ErrorDetails? = nil,
+        coverageReport: CoverageReport? = nil,
+        profilingReport: ProfilingReport? = nil
     ) {
         self.id = id
         self.specificationName = specificationName
@@ -44,6 +48,8 @@ struct VerificationResult: Identifiable {
         self.violatedInvariant = violatedInvariant
         self.explorationResult = explorationResult
         self.errorDetails = errorDetails
+        self.coverageReport = coverageReport
+        self.profilingReport = profilingReport
     }
 }
 

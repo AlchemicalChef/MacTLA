@@ -133,6 +133,94 @@ final class TLASyntaxHighlighter {
     }
 }
 
+// MARK: - NSAttributedString for UITextView (iOS)
+
+#if os(iOS)
+import UIKit
+
+extension TLASyntaxHighlighter {
+    /// Generates an NSAttributedString suitable for UITextView syntax highlighting
+    func highlight(_ source: String, fontSize: CGFloat, fontFamily: String = "Menlo", theme: HighlightTheme = .default) -> NSAttributedString {
+        let font = UIFont(name: fontFamily, size: fontSize) ?? .monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        return attributedStringForUITextView(source, font: font, theme: theme)
+    }
+
+    func attributedStringForUITextView(_ source: String, font: UIFont = .monospacedSystemFont(ofSize: 13, weight: .regular), theme: HighlightTheme = .default) -> NSAttributedString {
+        let lexer = TLALexer(source: source)
+        let tokens = lexer.scanTokens()
+
+        // Create mutable attributed string with default attributes
+        let attributedString = NSMutableAttributedString(string: source, attributes: [
+            .font: font,
+            .foregroundColor: UIColor.label
+        ])
+
+        for token in tokens {
+            guard token.length > 0 else { continue }
+
+            let offset = characterOffset(for: token, in: source)
+            guard offset < source.count else { continue }
+
+            let length = min(token.length, source.count - offset)
+            let range = NSRange(location: offset, length: length)
+
+            let (swiftUIColor, style) = colorAndStyle(for: token.type, theme: theme)
+            let uiColor = uiColor(from: swiftUIColor)
+
+            attributedString.addAttribute(.foregroundColor, value: uiColor, range: range)
+
+            // Apply font style
+            switch style {
+            case .bold:
+                let boldFont = UIFont.boldSystemFont(ofSize: font.pointSize)
+                let monospacedBold = UIFont(name: "\(font.fontName)-Bold", size: font.pointSize) ?? boldFont
+                attributedString.addAttribute(.font, value: monospacedBold, range: range)
+            case .italic:
+                let italicFont = UIFont.italicSystemFont(ofSize: font.pointSize)
+                let monospacedItalic = UIFont(name: "\(font.fontName)-Italic", size: font.pointSize) ?? italicFont
+                attributedString.addAttribute(.font, value: monospacedItalic, range: range)
+            case .normal:
+                break
+            }
+        }
+
+        return attributedString
+    }
+
+    /// Convert SwiftUI Color to UIColor
+    private func uiColor(from color: Color) -> UIColor {
+        switch color {
+        case .purple:
+            return UIColor.systemPurple
+        case .blue:
+            return UIColor.systemBlue
+        case .orange:
+            return UIColor.systemOrange
+        case .red:
+            return UIColor.systemRed
+        case .gray:
+            return UIColor.systemGray
+        case .green:
+            return UIColor.systemGreen
+        case .cyan:
+            return UIColor.systemCyan
+        case .teal:
+            return UIColor.systemTeal
+        case .pink:
+            return UIColor.systemPink
+        case .yellow:
+            return UIColor.systemYellow
+        case .white:
+            return UIColor.white
+        case .primary:
+            return UIColor.label
+        default:
+            return UIColor(color)
+        }
+    }
+}
+#endif
+
 // MARK: - NSAttributedString for NSTextView (macOS)
 
 #if os(macOS)

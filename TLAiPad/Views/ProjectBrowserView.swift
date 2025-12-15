@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
 #endif
@@ -9,6 +10,7 @@ struct ProjectBrowserView: View {
     @State private var recentProjects: [TLAProject] = []
     @State private var showError = false
     @State private var errorMessage = ""
+    @State private var isImporting = false
 
     var body: some View {
         NavigationStack {
@@ -57,6 +59,21 @@ struct ProjectBrowserView: View {
             } message: {
                 Text(errorMessage)
             }
+            #if !os(macOS)
+            .fileImporter(
+                isPresented: $isImporting,
+                allowedContentTypes: [.plainText, .text, .folder],
+                allowsMultipleSelection: true
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    importProjectURLs(urls)
+                case .failure(let error):
+                    errorMessage = error.localizedDescription
+                    showError = true
+                }
+            }
+            #endif
         }
     }
 
@@ -90,7 +107,7 @@ struct ProjectBrowserView: View {
             importProjectURLs(panel.urls)
         }
         #else
-        // iOS would use document picker - not implemented for macOS-only app
+        isImporting = true
         #endif
     }
 
@@ -99,6 +116,14 @@ struct ProjectBrowserView: View {
         var projectName = "Imported Project"
 
         for url in urls {
+            // Start accessing security-scoped resource for iOS
+            let didStartAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if didStartAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
             do {
                 var isDirectory: ObjCBool = false
                 if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),

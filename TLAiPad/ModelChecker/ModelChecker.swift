@@ -14,6 +14,11 @@ actor ModelChecker {
         var checkProperties: Bool = true
         var checkLiveness: Bool = true
 
+        // Simulation mode settings
+        var simulationMode: Bool = false
+        var simulationTraceCount: Int = 100     // Number of random traces to generate
+        var simulationTraceDepth: Int = 100     // Max depth per trace
+
         static let `default` = Configuration()
     }
 
@@ -95,12 +100,36 @@ actor ModelChecker {
         let name: String
     }
 
+    /// State constraint - limits exploration to states satisfying a predicate
+    struct ConstraintSpec {
+        let expression: String
+    }
+
+    /// Action constraint - filters transitions satisfying a predicate (can use primed variables)
+    struct ActionConstraintSpec {
+        let expression: String
+    }
+
+    /// View specification - project states to subset of variables for comparison
+    struct ViewSpec {
+        let expression: String
+    }
+
+    /// Symmetry set specification - values that can be permuted
+    struct SymmetrySetSpec {
+        let name: String  // Name of the symmetry set (e.g., "Permutations(Nodes)")
+    }
+
     func verify(
         specification: String,
         config: Configuration = .default,
         constants: [ConstantOverride] = [],
         invariants: [InvariantSpec] = [],
-        properties: [PropertySpec] = []
+        properties: [PropertySpec] = [],
+        constraints: [ConstraintSpec] = [],
+        actionConstraints: [ActionConstraintSpec] = [],
+        view: ViewSpec? = nil,
+        symmetrySets: [SymmetrySetSpec] = []
     ) async -> VerificationResult {
         guard !isRunning else {
             return VerificationResult(
@@ -119,6 +148,10 @@ actor ModelChecker {
         self.constantOverrides = constants
         self.explicitInvariants = invariants
         self.explicitProperties = properties
+        self.stateConstraints = constraints
+        self.stateActionConstraints = actionConstraints
+        self.viewSpec = view
+        self.symmetrySetSpecs = symmetrySets
 
         // Reset state tracking
         exploredStates = []
@@ -150,6 +183,11 @@ actor ModelChecker {
     private var constantOverrides: [ConstantOverride] = []
     private var explicitInvariants: [InvariantSpec] = []
     private var explicitProperties: [PropertySpec] = []
+    private var stateConstraints: [ConstraintSpec] = []
+    private var stateActionConstraints: [ActionConstraintSpec] = []
+    private var viewSpec: ViewSpec?
+    private var symmetrySetSpecs: [SymmetrySetSpec] = []
+    private var symmetryValues: Set<TLAValue> = []  // Resolved symmetry set values
 
     func cancel() {
         shouldCancel = true
@@ -208,9 +246,7 @@ actor ModelChecker {
                                 specificationName: module.name,
                                 status: .failure,
                                 error: "Invariant \(invariant.name) violated",
-                                counterexample: trace.map { s in
-                                    TraceState(variables: s.variables.mapValues { $0.description })
-                                }
+                                counterexample: trace.map { $0.toTraceState() }
                             )
                         )
                     }
@@ -246,9 +282,7 @@ actor ModelChecker {
                         specificationName: module.name,
                         status: .failure,
                         error: "Deadlock detected",
-                        counterexample: trace.map { s in
-                            TraceState(variables: s.variables.mapValues { $0.description })
-                        }
+                        counterexample: trace.map { $0.toTraceState() }
                     )
                 )
             }
@@ -300,6 +334,22 @@ actor ModelChecker {
         // Find invariants - use explicit list if provided, otherwise use heuristics
         let invariants = findInvariants(in: module, explicit: explicitInvariants)
 
+        // Resolve symmetry sets if any are specified
+        if !symmetrySetSpecs.isEmpty {
+            resolveSymmetrySets(module: module, interpreter: interpreter)
+        }
+
+        // If simulation mode is enabled, run simulation instead of exhaustive BFS
+        if configuration.simulationMode {
+            return await runSimulation(
+                module: module,
+                initDef: initDef,
+                nextDef: nextDef,
+                invariants: invariants,
+                interpreter: interpreter
+            )
+        }
+
         // Initialize state space exploration
         var visited: Set<StateHash> = []
         var queue: [TLAState] = []
@@ -309,14 +359,20 @@ actor ModelChecker {
         do {
             let initialStates = try interpreter.evaluateInit(initDef, module: module)
             for state in initialStates {
-                let hash = state.hash
+                // Use symmetry-aware hash if symmetry is enabled
+                let hash = computeStateHash(state)
                 if !visited.contains(hash) {
+                    // Apply state constraints - skip states that don't satisfy constraints
+                    if !stateConstraints.isEmpty && !satisfiesStateConstraints(state, module: module, interpreter: interpreter) {
+                        continue
+                    }
+
                     visited.insert(hash)
                     queue.append(state)
                     trace.append([state])
                     statistics.distinctStates += 1
 
-                    // Track state for visualization
+                    // Track state for visualization (use original state, not canonical)
                     stateHashToIndex[hash] = exploredStates.count
                     exploredStates.append(state)
                     initialStateHashes.insert(hash)
@@ -398,13 +454,19 @@ actor ModelChecker {
 
                     statistics.depth = max(statistics.depth, result.depth)
 
+                    // Recalculate fromHash with symmetry awareness
+                    let fromHash = !symmetryValues.isEmpty ?
+                        (batch.first(where: { computeStateHash($0) == result.fromHash }).map { computeStateHash($0) } ?? result.fromHash) :
+                        result.fromHash
+
                     for (successor, successorTrace) in zip(result.successors, result.successorTraces) {
                         statistics.statesGenerated += 1
-                        let hash = successor.hash
+                        // Use symmetry-aware hash if symmetry is enabled
+                        let hash = computeStateHash(successor)
 
                         // Track transition for visualization
                         stateTransitions.append(StateTransition(
-                            fromHash: result.fromHash,
+                            fromHash: fromHash,
                             toHash: hash,
                             action: nil
                         ))
@@ -422,7 +484,7 @@ actor ModelChecker {
                     }
 
                     if result.isDeadlock {
-                        errorStateHashes.insert(result.fromHash)
+                        errorStateHashes.insert(fromHash)
                     }
                 }
             } else {
@@ -451,9 +513,7 @@ actor ModelChecker {
                                     distinctStates: statistics.distinctStates,
                                     duration: statistics.elapsedTime,
                                     error: "Invariant \(invariant.name) violated",
-                                    counterexample: currentTrace.map { state in
-                                        TraceState(variables: state.variables.mapValues { $0.description })
-                                    },
+                                    counterexample: currentTrace.map { $0.toTraceState() },
                                     explorationResult: getExplorationResult()
                                 )
                             }
@@ -470,7 +530,8 @@ actor ModelChecker {
                 // Generate successor states
                 do {
                     let successors = try interpreter.evaluateNext(nextDef, state: currentState, module: module)
-                    let currentHash = currentState.hash
+                    // Use symmetry-aware hash if symmetry is enabled
+                    let currentHash = computeStateHash(currentState)
 
                     if successors.isEmpty && configuration.checkDeadlock {
                         // Mark as error state for visualization
@@ -483,16 +544,28 @@ actor ModelChecker {
                             distinctStates: statistics.distinctStates,
                             duration: statistics.elapsedTime,
                             error: "Deadlock detected",
-                            counterexample: currentTrace.map { state in
-                                TraceState(variables: state.variables.mapValues { $0.description })
-                            },
+                            counterexample: currentTrace.map { $0.toTraceState() },
                             explorationResult: getExplorationResult()
                         )
                     }
 
                     for successor in successors {
                         statistics.statesGenerated += 1
-                        let hash = successor.hash
+
+                        // Apply action constraints - skip transitions that don't satisfy constraints
+                        if !stateActionConstraints.isEmpty &&
+                           !satisfiesActionConstraints(fromState: currentState, toState: successor, module: module, interpreter: interpreter) {
+                            continue
+                        }
+
+                        // Apply state constraints - skip states that don't satisfy constraints
+                        if !stateConstraints.isEmpty &&
+                           !satisfiesStateConstraints(successor, module: module, interpreter: interpreter) {
+                            continue
+                        }
+
+                        // Use symmetry-aware hash if symmetry is enabled
+                        let hash = computeStateHash(successor)
 
                         // Track transition for visualization
                         stateTransitions.append(StateTransition(
@@ -564,10 +637,9 @@ actor ModelChecker {
                         duration: statistics.elapsedTime,
                         error: "Temporal property violated: \(describeProperty(result.property))",
                         counterexample: result.counterexample?.enumerated().map { index, state in
-                            TraceState(
+                            state.toTraceState(
                                 stepNumber: index,
                                 action: index == result.loopStart ? "← Loop starts here" : "",
-                                state: state.variables.mapValues { $0.description },
                                 isError: index == (result.counterexample?.count ?? 0) - 1
                             )
                         } ?? [],
@@ -684,6 +756,28 @@ actor ModelChecker {
         }
     }
 
+    // MARK: - Successor Map Helpers
+
+    /// Builds a simple successor map from state transitions (hash -> [hash])
+    private func buildSuccessorMap() -> [StateHash: [StateHash]] {
+        var successors: [StateHash: [StateHash]] = [:]
+        for transition in stateTransitions {
+            successors[transition.fromHash, default: []].append(transition.toHash)
+        }
+        return successors
+    }
+
+    /// Builds a successor map that includes action names (hash -> [(hash, action?)])
+    private func buildSuccessorMapWithActions() -> [StateHash: [(hash: StateHash, action: String?)]] {
+        var successors: [StateHash: [(hash: StateHash, action: String?)]] = [:]
+        for transition in stateTransitions {
+            successors[transition.fromHash, default: []].append((transition.toHash, transition.action))
+        }
+        return successors
+    }
+
+    // MARK: - Temporal Property Checking
+
     private func checkEventually(_ predicate: String, module: TLAModule, interpreter: TLAInterpreter) -> Bool {
         // Check if any explored state satisfies the predicate
         for state in exploredStates {
@@ -724,10 +818,7 @@ actor ModelChecker {
         }
 
         // Build successor map
-        var successors: [StateHash: [StateHash]] = [:]
-        for transition in stateTransitions {
-            successors[transition.fromHash, default: []].append(transition.toHash)
-        }
+        let successors = buildSuccessorMap()
 
         // Nested DFS to find accepting cycle
         var visited1: Set<StateHash> = []
@@ -819,10 +910,7 @@ actor ModelChecker {
         // This is equivalent to [](P => <>Q)
 
         // Build successor map
-        var successors: [StateHash: [StateHash]] = [:]
-        for transition in stateTransitions {
-            successors[transition.fromHash, default: []].append(transition.toHash)
-        }
+        let successors = buildSuccessorMap()
 
         // For each state where P holds, check if Q is reachable
         for state in exploredStates {
@@ -878,10 +966,7 @@ actor ModelChecker {
         interpreter: TLAInterpreter
     ) -> TemporalCheckResult {
         // Build successor map with action labels
-        var successors: [StateHash: [(hash: StateHash, action: String?)]] = [:]
-        for transition in stateTransitions {
-            successors[transition.fromHash, default: []].append((transition.toHash, transition.action))
-        }
+        let successors = buildSuccessorMapWithActions()
 
         // Find states where the action is enabled
         func isActionEnabled(in state: TLAState) -> Bool {
@@ -972,10 +1057,7 @@ actor ModelChecker {
         interpreter: TLAInterpreter
     ) -> TemporalCheckResult {
         // Build successor map with action labels
-        var successors: [StateHash: [(hash: StateHash, action: String?)]] = [:]
-        for transition in stateTransitions {
-            successors[transition.fromHash, default: []].append((transition.toHash, transition.action))
-        }
+        let successors = buildSuccessorMapWithActions()
 
         // Find states where the action is enabled
         func isActionEnabled(in state: TLAState) -> Bool {
@@ -1066,10 +1148,7 @@ actor ModelChecker {
     ) -> Bool {
         // Simplified check - would need full SCC computation for accuracy
         // Check if all successors also satisfy the predicate
-        var successors: [StateHash: [StateHash]] = [:]
-        for transition in stateTransitions {
-            successors[transition.fromHash, default: []].append(transition.toHash)
-        }
+        let successors = buildSuccessorMap()
 
         var visited: Set<StateHash> = []
         var queue: [StateHash] = [state.hash]
@@ -1102,15 +1181,8 @@ actor ModelChecker {
             return false
         }
 
-        var env = TLAInterpreter.Environment()
+        var env = TLAInterpreter.Environment.from(module: module)
         env.variables = state.variables
-
-        // Add module operators
-        for decl in module.declarations {
-            if case .operatorDef(let def) = decl {
-                env.operators[def.name] = def
-            }
-        }
 
         do {
             let result = try interpreter.evaluate(expr, in: env)
@@ -1122,6 +1194,402 @@ actor ModelChecker {
         }
 
         return false
+    }
+
+    /// Evaluates a state constraint - returns true if the state satisfies the constraint
+    private func evaluateStateConstraint(_ constraint: ConstraintSpec, state: TLAState, module: TLAModule, interpreter: TLAInterpreter) -> Bool {
+        return evaluatePredicate(constraint.expression, in: state, module: module, interpreter: interpreter)
+    }
+
+    /// Evaluates all state constraints - returns true if the state satisfies ALL constraints
+    private func satisfiesStateConstraints(_ state: TLAState, module: TLAModule, interpreter: TLAInterpreter) -> Bool {
+        for constraint in stateConstraints {
+            if !evaluateStateConstraint(constraint, state: state, module: module, interpreter: interpreter) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Evaluates an action constraint - returns true if the transition satisfies the constraint
+    /// Action constraints can reference both current state variables and primed variables
+    private func evaluateActionConstraint(_ constraint: ActionConstraintSpec, fromState: TLAState, toState: TLAState, module: TLAModule, interpreter: TLAInterpreter) -> Bool {
+        let parser = TLAParser()
+        guard case .success(let expr) = parser.parseExpression(constraint.expression) else {
+            return false
+        }
+
+        var env = TLAInterpreter.Environment.from(module: module)
+        env.variables = fromState.variables
+        env.primedVariables = toState.variables
+
+        do {
+            let result = try interpreter.evaluate(expr, in: env)
+            if case .boolean(let b) = result {
+                return b
+            }
+        } catch {
+            // Evaluation failed
+        }
+
+        return false
+    }
+
+    /// Evaluates all action constraints - returns true if the transition satisfies ALL constraints
+    private func satisfiesActionConstraints(fromState: TLAState, toState: TLAState, module: TLAModule, interpreter: TLAInterpreter) -> Bool {
+        for constraint in stateActionConstraints {
+            if !evaluateActionConstraint(constraint, fromState: fromState, toState: toState, module: module, interpreter: interpreter) {
+                return false
+            }
+        }
+        return true
+    }
+
+    // MARK: - Symmetry Reduction
+
+    /// Resolves symmetry set specifications to actual values
+    private func resolveSymmetrySets(module: TLAModule, interpreter: TLAInterpreter) {
+        symmetryValues = []
+
+        // Build constant overrides dictionary
+        var constantOverrideValues: [String: TLAValue] = [:]
+        for override in constantOverrides {
+            if let value = parseConstantValue(override.value) {
+                constantOverrideValues[override.name] = value
+            }
+        }
+
+        for spec in symmetrySetSpecs {
+            // Parse the symmetry set expression (e.g., "Permutations(Nodes)" or just "Nodes")
+            let expression = spec.name
+
+            // Try to evaluate the expression
+            let parser = TLAParser()
+            if case .success(let expr) = parser.parseExpression(expression) {
+                var env = TLAInterpreter.Environment.from(module: module, constantOverrides: constantOverrideValues)
+
+                // Try to evaluate to get the set of symmetric values
+                if let result = try? interpreter.evaluate(expr, in: env) {
+                    switch result {
+                    case .set(let values):
+                        symmetryValues.formUnion(values)
+                    default:
+                        // If not a set, treat the expression name as a constant set reference
+                        if let constValue = env.constants[expression] {
+                            if case .set(let values) = constValue {
+                                symmetryValues.formUnion(values)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse a constant value string into a TLAValue
+    private func parseConstantValue(_ valueStr: String) -> TLAValue? {
+        let trimmed = valueStr.trimmingCharacters(in: .whitespaces)
+
+        // Try to parse as number
+        if let n = Int(trimmed) {
+            return .integer(n)
+        }
+
+        // Try to parse as boolean
+        if trimmed.uppercased() == "TRUE" {
+            return .boolean(true)
+        }
+        if trimmed.uppercased() == "FALSE" {
+            return .boolean(false)
+        }
+
+        // Try to parse as set: {a, b, c}
+        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
+            let inner = String(trimmed.dropFirst().dropLast())
+            let elements = inner.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            var values: Set<TLAValue> = []
+            for elem in elements where !elem.isEmpty {
+                // Treat each element as a model value
+                values.insert(.modelValue(elem))
+            }
+            return .set(values)
+        }
+
+        // Default: treat as model value
+        return .modelValue(trimmed)
+    }
+
+    /// Canonicalizes a state by mapping symmetric values to their canonical form
+    /// Uses lexicographic ordering to choose the canonical representative
+    private func canonicalizeState(_ state: TLAState) -> TLAState {
+        guard !symmetryValues.isEmpty else { return state }
+
+        // Find all symmetric values that appear in this state
+        var usedSymValues: [TLAValue] = []
+        for (_, value) in state.variables {
+            collectSymmetricValues(from: value, into: &usedSymValues)
+        }
+
+        // If no symmetric values are used, return as-is
+        guard !usedSymValues.isEmpty else { return state }
+
+        // Sort the used symmetric values to create a canonical mapping
+        // Map the first-encountered symmetric value to the smallest canonical value, etc.
+        let sortedSymValues = Array(symmetryValues).sorted { $0.sortKey < $1.sortKey }
+        let usedSorted = usedSymValues.sorted { $0.sortKey < $1.sortKey }
+
+        // Create mapping from original values to canonical values
+        var mapping: [TLAValue: TLAValue] = [:]
+        for (index, originalValue) in usedSorted.enumerated() {
+            if index < sortedSymValues.count {
+                mapping[originalValue] = sortedSymValues[index]
+            }
+        }
+
+        // Apply the mapping to create canonical state
+        var canonicalVars: [String: TLAValue] = [:]
+        for (name, value) in state.variables {
+            canonicalVars[name] = applySymmetryMapping(to: value, mapping: mapping)
+        }
+
+        return TLAState(variables: canonicalVars)
+    }
+
+    /// Collect all symmetric values that appear in a TLAValue
+    private func collectSymmetricValues(from value: TLAValue, into collection: inout [TLAValue]) {
+        if symmetryValues.contains(value) {
+            if !collection.contains(value) {
+                collection.append(value)
+            }
+            return
+        }
+
+        switch value {
+        case .set(let elements):
+            for elem in elements {
+                collectSymmetricValues(from: elem, into: &collection)
+            }
+        case .sequence(let elements):
+            for elem in elements {
+                collectSymmetricValues(from: elem, into: &collection)
+            }
+        case .record(let fields):
+            for (_, fieldValue) in fields {
+                collectSymmetricValues(from: fieldValue, into: &collection)
+            }
+        case .function(let mappings):
+            for (key, val) in mappings {
+                collectSymmetricValues(from: key, into: &collection)
+                collectSymmetricValues(from: val, into: &collection)
+            }
+        default:
+            break
+        }
+    }
+
+    /// Apply symmetry mapping to a value
+    private func applySymmetryMapping(to value: TLAValue, mapping: [TLAValue: TLAValue]) -> TLAValue {
+        // Direct mapping
+        if let mapped = mapping[value] {
+            return mapped
+        }
+
+        // Recursive mapping for compound values
+        switch value {
+        case .set(let elements):
+            return .set(Set(elements.map { applySymmetryMapping(to: $0, mapping: mapping) }))
+        case .sequence(let elements):
+            return .sequence(elements.map { applySymmetryMapping(to: $0, mapping: mapping) })
+        case .record(let fields):
+            var mappedFields: [String: TLAValue] = [:]
+            for (key, val) in fields {
+                mappedFields[key] = applySymmetryMapping(to: val, mapping: mapping)
+            }
+            return .record(mappedFields)
+        case .function(let mappings):
+            var mappedFunction: [TLAValue: TLAValue] = [:]
+            for (key, val) in mappings {
+                let mappedKey = applySymmetryMapping(to: key, mapping: mapping)
+                let mappedVal = applySymmetryMapping(to: val, mapping: mapping)
+                mappedFunction[mappedKey] = mappedVal
+            }
+            return .function(mappedFunction)
+        default:
+            return value
+        }
+    }
+
+    /// Computes the hash of a state, using canonical form if symmetry is enabled
+    private func computeStateHash(_ state: TLAState) -> StateHash {
+        if !symmetryValues.isEmpty {
+            let canonical = canonicalizeState(state)
+            return canonical.hash
+        }
+        return state.hash
+    }
+
+    // MARK: - Simulation Mode
+
+    /// Runs simulation mode - random trace generation instead of exhaustive BFS
+    private func runSimulation(
+        module: TLAModule,
+        initDef: OperatorDefinition,
+        nextDef: OperatorDefinition,
+        invariants: [OperatorDefinition],
+        interpreter: TLAInterpreter
+    ) async -> VerificationResult {
+        var actionCoverage: [String: Int] = [:]  // Track how often each action is taken
+        var statesVisited = 0
+        var tracesGenerated = 0
+        var maxDepthReached = 0
+
+        // Generate initial states
+        let initialStates: [TLAState]
+        do {
+            initialStates = try interpreter.evaluateInit(initDef, module: module)
+            if initialStates.isEmpty {
+                return VerificationResult(
+                    specificationName: module.name,
+                    status: .error,
+                    error: "No initial states generated"
+                )
+            }
+        } catch {
+            return VerificationResult(
+                specificationName: module.name,
+                status: .error,
+                error: "Error evaluating Init: \(error)"
+            )
+        }
+
+        // Run simulation traces
+        for traceNum in 0..<configuration.simulationTraceCount {
+            if shouldCancel { break }
+
+            tracesGenerated += 1
+
+            // Pick a random initial state
+            let initialState = initialStates.randomElement()!
+            var currentState = initialState
+            var trace: [TLAState] = [currentState]
+            var depth = 0
+
+            // Run trace until max depth or deadlock
+            while depth < configuration.simulationTraceDepth && !shouldCancel {
+                depth += 1
+                statesVisited += 1
+
+                // Check invariants
+                if configuration.checkInvariants {
+                    for invariant in invariants {
+                        do {
+                            let holds = try interpreter.evaluateInvariant(invariant, state: currentState, module: module)
+                            if !holds {
+                                return VerificationResult(
+                                    specificationName: module.name,
+                                    status: .failure,
+                                    statesExplored: statesVisited,
+                                    distinctStates: 0,  // Not tracked in simulation
+                                    duration: statistics.elapsedTime,
+                                    error: "Invariant \(invariant.name) violated (simulation trace \(traceNum + 1))",
+                                    counterexample: trace.map { $0.toTraceState() }
+                                )
+                            }
+                        } catch {
+                            return VerificationResult(
+                                specificationName: module.name,
+                                status: .error,
+                                error: "Error checking invariant \(invariant.name): \(error)"
+                            )
+                        }
+                    }
+                }
+
+                // Generate successors
+                do {
+                    var successors = try interpreter.evaluateNext(nextDef, state: currentState, module: module)
+
+                    // Apply state constraints if any
+                    if !stateConstraints.isEmpty {
+                        successors = successors.filter { satisfiesStateConstraints($0, module: module, interpreter: interpreter) }
+                    }
+
+                    // Apply action constraints if any
+                    if !stateActionConstraints.isEmpty {
+                        successors = successors.filter { satisfiesActionConstraints(fromState: currentState, toState: $0, module: module, interpreter: interpreter) }
+                    }
+
+                    if successors.isEmpty {
+                        // Deadlock - end trace
+                        if configuration.checkDeadlock {
+                            return VerificationResult(
+                                specificationName: module.name,
+                                status: .failure,
+                                statesExplored: statesVisited,
+                                distinctStates: 0,
+                                duration: statistics.elapsedTime,
+                                error: "Deadlock detected (simulation trace \(traceNum + 1))",
+                                counterexample: trace.map { $0.toTraceState() }
+                            )
+                        }
+                        break  // End trace without error
+                    }
+
+                    // Pick a random successor
+                    let nextState = successors.randomElement()!
+                    trace.append(nextState)
+                    currentState = nextState
+
+                    // Track action coverage (simplified - just count transitions)
+                    actionCoverage["_transition", default: 0] += 1
+
+                } catch {
+                    return VerificationResult(
+                        specificationName: module.name,
+                        status: .error,
+                        error: "Error evaluating Next: \(error)"
+                    )
+                }
+            }
+
+            maxDepthReached = max(maxDepthReached, depth)
+
+            // Yield periodically
+            if traceNum % 10 == 0 {
+                await Task.yield()
+            }
+        }
+
+        if shouldCancel {
+            return VerificationResult(
+                specificationName: module.name,
+                status: .cancelled,
+                statesExplored: statesVisited,
+                distinctStates: 0,
+                duration: statistics.elapsedTime
+            )
+        }
+
+        // Build coverage report
+        let coverageReport = actionCoverage.map { "\($0.key): \($0.value)" }.joined(separator: "\n")
+
+        return VerificationResult(
+            specificationName: module.name,
+            status: .success,
+            statesExplored: statesVisited,
+            distinctStates: 0,  // Not tracked in simulation
+            duration: statistics.elapsedTime,
+            output: """
+            Simulation completed successfully.
+            Traces generated: \(tracesGenerated)
+            States visited: \(statesVisited)
+            Maximum depth: \(maxDepthReached)
+            Time: \(String(format: "%.2f", statistics.elapsedTime))s
+
+            Coverage:
+            \(coverageReport)
+            """
+        )
     }
 
     /// Find temporal properties defined in the module
@@ -1141,22 +1609,20 @@ actor ModelChecker {
                         properties.append(.leadsto(parts[0].trimmingCharacters(in: .whitespaces),
                                                    parts[1].trimmingCharacters(in: .whitespaces)))
                     }
-                } else if name.hasPrefix("[]<>") || name.hasPrefix("[]<>") {
-                    // Always eventually: []<>P
-                    let predicate = name.replacingOccurrences(of: "[]<>", with: "").trimmingCharacters(in: .whitespaces)
-                    properties.append(.alwaysEventually(predicate.isEmpty ? name : predicate))
-                } else if name.hasPrefix("<>[]") {
-                    // Eventually always: <>[]P
-                    let predicate = name.replacingOccurrences(of: "<>[]", with: "").trimmingCharacters(in: .whitespaces)
-                    properties.append(.eventuallyAlways(predicate.isEmpty ? name : predicate))
-                } else if name.hasPrefix("<>") {
-                    // Eventually: <>P
-                    let predicate = name.replacingOccurrences(of: "<>", with: "").trimmingCharacters(in: .whitespaces)
-                    properties.append(.eventually(predicate.isEmpty ? name : predicate))
-                } else if name.hasPrefix("[]") {
-                    // Always: []P (usually handled as invariant, but support it)
-                    let predicate = name.replacingOccurrences(of: "[]", with: "").trimmingCharacters(in: .whitespaces)
-                    properties.append(.always(predicate.isEmpty ? name : predicate))
+                } else if let temporalOp = TemporalOperator.detect(in: name) {
+                    // Use TemporalOperator enum to parse temporal formulas
+                    let predicate = temporalOp.extractPredicate(from: name)
+                    let resultPredicate = predicate.isEmpty ? name : predicate
+                    switch temporalOp {
+                    case .alwaysEventually:
+                        properties.append(.alwaysEventually(resultPredicate))
+                    case .eventuallyAlways:
+                        properties.append(.eventuallyAlways(resultPredicate))
+                    case .eventually:
+                        properties.append(.eventually(resultPredicate))
+                    case .always:
+                        properties.append(.always(resultPredicate))
+                    }
                 } else if name.hasPrefix("WF_") || name.hasPrefix("WF(") {
                     // Weak fairness
                     let action = name.replacingOccurrences(of: "WF_", with: "")

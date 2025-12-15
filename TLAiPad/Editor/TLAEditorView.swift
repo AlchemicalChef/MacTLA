@@ -40,44 +40,63 @@ struct TLAEditorView: View {
     }
     #endif
 
-    // MARK: - iOS Editor (Fallback)
+    // MARK: - iOS Editor (Native UITextView with syntax highlighting)
 
     #if os(iOS)
     @FocusState private var isFocused: Bool
 
     private var iOSEditor: some View {
-        TextEditor(text: $file.content)
-            .font(.system(.body, design: .monospaced))
-            .focused($isFocused)
-            .onChange(of: file.content) { _, _ in
+        iOSTextEditor(
+            text: $file.content,
+            fontSize: CGFloat(settings.fontSize),
+            fontFamily: settings.fontFamily,
+            showLineNumbers: settings.showLineNumbers,
+            onChange: { _ in
                 file.hasUnsavedChanges = true
             }
-            .toolbar {
-                ToolbarItemGroup(placement: .keyboard) {
-                    Button(action: { insertTemplate(.conjunction) }) {
-                        Text("/\\")
-                    }
-                    Button(action: { insertTemplate(.disjunction) }) {
-                        Text("\\/")
-                    }
-                    Button(action: { insertTemplate(.forall) }) {
-                        Text("\\A")
-                    }
-                    Button(action: { insertTemplate(.exists) }) {
-                        Text("\\E")
-                    }
-                    Button(action: { insertTemplate(.elementOf) }) {
-                        Text("\\in")
-                    }
-                    Button(action: { insertTemplate(.mapsto) }) {
-                        Text("|->")
-                    }
-                    Spacer()
-                    Button("Done") {
-                        isFocused = false
+        )
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        Button(action: { insertTemplate(.conjunction) }) {
+                            Text("/\\").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.disjunction) }) {
+                            Text("\\/").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.forall) }) {
+                            Text("\\A").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.exists) }) {
+                            Text("\\E").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.elementOf) }) {
+                            Text("\\in").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.mapsto) }) {
+                            Text("|->").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.prime) }) {
+                            Text("'").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.implies) }) {
+                            Text("=>").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.always) }) {
+                            Text("[]").font(.system(.body, design: .monospaced))
+                        }
+                        Button(action: { insertTemplate(.eventually) }) {
+                            Text("<>").font(.system(.body, design: .monospaced))
+                        }
                     }
                 }
+                Spacer()
+                Button("Done") {
+                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                }
             }
+        }
     }
 
     private func insertTemplate(_ template: TLATemplate) {

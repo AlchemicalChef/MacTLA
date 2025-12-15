@@ -87,24 +87,80 @@ final class TLAInterpreter {
         return nil
     }
 
+    /// Evaluation environment for TLA+ expressions
+    ///
+    /// The `Environment` struct holds all the bindings needed to evaluate TLA+ expressions,
+    /// including variable values, constant definitions, operator definitions, and primed
+    /// variable values for action evaluation.
+    ///
+    /// ## Components
+    /// - **Variables**: Current state variable bindings (e.g., `x = 5`)
+    /// - **Constants**: Constant values from the specification or configuration
+    /// - **Operators**: User-defined operator definitions from the module
+    /// - **Primed Variables**: Next-state variable values for action constraint evaluation
+    ///
+    /// ## Usage
+    /// ```swift
+    /// // Create from a module
+    /// let env = TLAInterpreter.Environment.from(module: myModule)
+    ///
+    /// // Add variable bindings
+    /// var envWithVars = env
+    /// envWithVars.variables["x"] = .integer(5)
+    ///
+    /// // Create with bound variable
+    /// let newEnv = env.binding("y", to: .boolean(true))
+    /// ```
+    ///
+    /// ## Thread Safety
+    /// Environment is a value type (struct) and is safe to copy and modify independently.
     struct Environment {
+        /// Current state variable bindings
         var variables: [String: TLAValue]
+
+        /// Constant values (from CONSTANT declarations or configuration)
         var constants: [String: TLAValue]
+
+        /// Operator definitions from the module
         var operators: [String: OperatorDefinition]
+
+        /// Current recursion depth for detecting infinite recursion
         var recursionDepth: Int
 
+        /// Primed variable values for action constraint evaluation
+        ///
+        /// When evaluating action constraints or the Next relation, primed variables
+        /// (e.g., `x'`) represent the values in the successor state.
+        var primedVariables: [String: TLAValue]
+
+        /// Creates a new environment with the specified bindings
+        ///
+        /// - Parameters:
+        ///   - variables: Initial variable bindings (default: empty)
+        ///   - constants: Constant value bindings (default: empty)
+        ///   - operators: Operator definitions (default: empty)
+        ///   - recursionDepth: Current recursion depth (default: 0)
+        ///   - primedVariables: Primed variable bindings (default: empty)
         init(
             variables: [String: TLAValue] = [:],
             constants: [String: TLAValue] = [:],
             operators: [String: OperatorDefinition] = [:],
-            recursionDepth: Int = 0
+            recursionDepth: Int = 0,
+            primedVariables: [String: TLAValue] = [:]
         ) {
             self.variables = variables
             self.constants = constants
             self.operators = operators
             self.recursionDepth = recursionDepth
+            self.primedVariables = primedVariables
         }
 
+        /// Creates a new environment with an additional variable binding
+        ///
+        /// - Parameters:
+        ///   - name: The variable name to bind
+        ///   - value: The value to bind to the variable
+        /// - Returns: A new environment with the variable bound
         func binding(_ name: String, to value: TLAValue) -> Environment {
             var env = self
             env.variables[name] = value
@@ -112,6 +168,9 @@ final class TLAInterpreter {
         }
 
         /// Returns new environment with incremented recursion depth
+        ///
+        /// - Throws: `InterpreterError.evaluationError` if maximum recursion depth is exceeded
+        /// - Returns: A new environment with recursion depth incremented by 1
         func incrementingRecursion() throws -> Environment {
             guard recursionDepth < TLAInterpreter.maxRecursionDepth else {
                 throw InterpreterError.evaluationError("Maximum recursion depth (\(TLAInterpreter.maxRecursionDepth)) exceeded")
@@ -229,9 +288,22 @@ final class TLAInterpreter {
     func evaluate(_ expr: TLAExpression, in env: Environment) throws -> TLAValue {
         switch expr {
         case .identifier(let name, _):
-            // Check for primed variable - name is already "x'" so just look it up
-            if let value = env.variables[name] {
-                return value
+            // Check for primed variable - name is already "x'" so look it up in primedVariables first
+            if name.hasSuffix("'") {
+                let baseName = String(name.dropLast())
+                // First check primedVariables (for action constraint evaluation)
+                if let value = env.primedVariables[baseName] {
+                    return value
+                }
+                // Fall back to looking up the full name in variables (legacy behavior)
+                if let value = env.variables[name] {
+                    return value
+                }
+            } else {
+                // Regular variable lookup
+                if let value = env.variables[name] {
+                    return value
+                }
             }
             if let value = env.constants[name] {
                 return value
