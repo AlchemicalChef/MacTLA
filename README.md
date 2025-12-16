@@ -1,10 +1,12 @@
 # MacTLA
 
-A feature-complete TLA+ verification toolbox for macOS, built natively in Swift.
+A feature-complete TLA+ verification toolbox for macOS and iPad, built natively in Swift.
 
 ## Overview
 
-MacTLA brings the full TLA+ specification and model checking experience to macOS. Write, verify, and explore TLA+ specifications with a native, optimized interface.
+MacTLA brings the full TLA+ specification and model checking experience to Apple platforms. Write, verify, and explore TLA+ specifications with a native, optimized interface.
+
+**Platforms:** macOS 14.0+ | iPadOS 17.0+
 
 ## Features
 
@@ -20,8 +22,14 @@ MacTLA brings the full TLA+ specification and model checking experience to macOS
 - Complete TLA+ lexer and recursive descent parser
 - Full AST generation for modules, declarations, and expressions
 - PlusCal algorithm translation to pure TLA+
-- Support for all TLA+ operators (`/\`, `\/`, `\A`, `\E`, `[]`, `<>`, etc.)
-- Standard library functions (Len, Head, Tail, Append, Seq, etc.)
+- Support for all TLA+ operators:
+  - Logical: `/\`, `\/`, `~`, `=>`, `<=>`
+  - Quantifiers: `\A`, `\E`, `CHOOSE`
+  - Temporal: `[]`, `<>`, `~>`, `WF_`, `SF_`
+  - Set: `\in`, `\notin`, `\cup`, `\cap`, `\subseteq`, `SUBSET`, `UNION`
+  - Arithmetic: `+`, `-`, `*`, `\div`, `%`, `^`, `..`
+- Standard library functions (Len, Head, Tail, Append, SubSeq, etc.)
+- Unicode operator support (∧, ∨, ∀, ∃, □, ◇, ≤, ≥, ≠)
 
 ### Editor
 - Native NSTextView-based editor with syntax highlighting
@@ -47,6 +55,29 @@ MacTLA brings the full TLA+ specification and model checking experience to macOS
 - Support for `.tla`, `.cfg`, and `.tlaps` files
 - Built-in templates (Basic, Mutex, Producer-Consumer, Two-Phase Commit, Raft)
 
+## Quick Start
+
+1. Create a new specification or open an existing `.tla` file
+2. Write your TLA+ specification:
+
+```tla
+---- MODULE Counter ----
+VARIABLE count
+
+Init == count = 0
+
+Increment == count' = count + 1
+Decrement == count > 0 /\ count' = count - 1
+
+Next == Increment \/ Decrement
+
+AlwaysNonNegative == count >= 0
+====
+```
+
+3. Press **Cmd+R** to run the model checker
+4. View results in the verification panel and explore the state graph
+
 ## Screenshots
 
 <p align="center">
@@ -55,7 +86,7 @@ MacTLA brings the full TLA+ specification and model checking experience to macOS
 
 ## Requirements
 
-- macOS 14.0+
+- macOS 14.0+ / iPadOS 17.0+
 - Xcode 15+ (for building)
 - Swift 5.9+
 - XcodeGen (for project generation)
@@ -71,15 +102,26 @@ brew install xcodegen
 # Generate the Xcode project
 xcodegen generate
 
-# Build the project
+# Build for macOS
 xcodebuild -scheme MacTLA -destination 'platform=macOS' build
 
-# Build for release
+# Build for iPad
+xcodebuild -scheme TLAiPad -destination 'generic/platform=iOS' build
+
+# Build for release (macOS)
 xcodebuild -scheme MacTLA -configuration Release -destination 'platform=macOS'
 
 # Open in Xcode
 open MacTLA.xcodeproj
 ```
+
+### Targets
+
+| Target | Platform | Description |
+|--------|----------|-------------|
+| `MacTLA` | macOS | Full-featured desktop app |
+| `TLAiPad` | iPadOS | Touch-optimized iPad app |
+| `MacTLATests` | macOS | Test suite |
 
 ## Architecture
 
@@ -115,15 +157,32 @@ TLAiPad/
 # Run all tests
 xcodebuild test -scheme MacTLA -destination 'platform=macOS'
 
+# Run with code coverage
+xcodebuild test -scheme MacTLA -destination 'platform=macOS' -enableCodeCoverage YES
+
 # Run specific test suite
 xcodebuild test -scheme MacTLA -destination 'platform=macOS' \
   -only-testing:MacTLATests/TLALexerTests
 ```
 
-Test coverage includes:
-- `TLALexerTests` - Tokenization
-- `TLAParserTests` - AST generation
-- `TLAInterpreterTests` - Expression evaluation
+### Test Suites
+
+| Suite | Tests | Description |
+|-------|-------|-------------|
+| `TLALexerTests` | 9 | Tokenization of TLA+ source |
+| `TLAParserTests` | 48 | AST generation and parsing |
+| `TLAInterpreterTests` | 47 | Expression evaluation |
+| `TLAParsingCompleteTests` | 97 | Comprehensive lexer/parser coverage |
+| `UIComponentTests` | 44 | Models, state management, UI components |
+| `ModelCheckerTests` | 17 | State exploration and verification |
+| `Level1_ParserCorrectnessTests` | 15 | Parser correctness validation |
+| `Level1_InterpreterOperatorTests` | 30 | Operator evaluation |
+| `Level1_TemporalPropertyTests` | 20 | Temporal property checking |
+| `Level2_IntegrationTests` | 18 | Multi-component integration |
+| `Level3_ConformanceTests` | 12 | Classic TLA+ spec conformance |
+| `Level4_CertificationTests` | 17 | Certification evidence |
+
+**Total: 400+ tests** covering parser, interpreter, model checker, and UI components.
 
 ## Keyboard Shortcuts
 
