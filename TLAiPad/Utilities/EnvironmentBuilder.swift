@@ -61,14 +61,4 @@ extension TLAInterpreter.Environment {
         return env
     }
 
-    /// Convenience method to bind multiple variables at once
-    /// - Parameter variables: Dictionary of variable names to values
-    /// - Returns: A new environment with the variables bound
-    func binding(variables: [String: TLAValue]) -> TLAInterpreter.Environment {
-        var env = self
-        for (name, value) in variables {
-            env.variables[name] = value
-        }
-        return env
-    }
 }

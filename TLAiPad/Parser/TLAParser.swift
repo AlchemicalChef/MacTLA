@@ -413,6 +413,33 @@ final class TLAParser {
         }
     }
 
+    /// Parses TLA+ source code into an abstract syntax tree.
+    ///
+    /// This is the main entry point for parsing TLA+ specifications. The parser performs
+    /// lexical analysis followed by recursive descent parsing to produce a `TLAModule` AST.
+    ///
+    /// - Parameter source: The TLA+ source code string to parse
+    /// - Returns: A `Result` containing either:
+    ///   - `.success(TLAModule)`: The parsed module with all declarations
+    ///   - `.failure(ParseErrors)`: Collection of syntax errors encountered during parsing
+    ///
+    /// ## Example
+    /// ```swift
+    /// let parser = TLAParser()
+    /// let result = parser.parse("""
+    ///     ---- MODULE Example ----
+    ///     VARIABLE x
+    ///     Init == x = 0
+    ///     ====
+    ///     """)
+    ///
+    /// switch result {
+    /// case .success(let module):
+    ///     print("Parsed module: \(module.name)")
+    /// case .failure(let errors):
+    ///     print("Parse errors: \(errors)")
+    /// }
+    /// ```
     func parse(_ source: String) -> Result<TLAModule, ParseErrors> {
         let lexer = TLALexer(source: source)
         self.tokens = lexer.scanTokens()

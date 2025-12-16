@@ -37,12 +37,12 @@ final class TLAInterpreter {
         }
 
         // String (quoted)
-        if trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"") {
+        if trimmed.hasPrefix("\"") && trimmed.hasSuffix("\"") && trimmed.count >= 2 {
             return .string(String(trimmed.dropFirst().dropLast()))
         }
 
         // Set enumeration: {a, b, c}
-        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") {
+        if trimmed.hasPrefix("{") && trimmed.hasSuffix("}") && trimmed.count >= 2 {
             let inner = String(trimmed.dropFirst().dropLast())
             if inner.isEmpty {
                 return .set([])
@@ -54,7 +54,7 @@ final class TLAInterpreter {
         }
 
         // Sequence: <<a, b, c>>
-        if trimmed.hasPrefix("<<") && trimmed.hasSuffix(">>") {
+        if trimmed.hasPrefix("<<") && trimmed.hasSuffix(">>") && trimmed.count >= 4 {
             let inner = String(trimmed.dropFirst(2).dropLast(2))
             if inner.isEmpty {
                 return .sequence([])
@@ -285,6 +285,35 @@ final class TLAInterpreter {
 
     // MARK: - Expression Evaluation
 
+    /// Evaluates a TLA+ expression in the given environment.
+    ///
+    /// This is the core evaluation function that recursively processes TLA+ AST nodes
+    /// and returns concrete `TLAValue` results. It supports all TLA+ expression forms
+    /// including arithmetic, logical, set, sequence, record, and function operations.
+    ///
+    /// - Parameters:
+    ///   - expr: The TLA+ expression AST node to evaluate
+    ///   - env: The evaluation environment containing variable bindings, constants,
+    ///          operator definitions, and primed variable values
+    ///
+    /// - Returns: The computed `TLAValue` result of the expression
+    ///
+    /// - Throws: `InterpreterError` if evaluation fails due to:
+    ///   - Undefined variable or operator references
+    ///   - Type mismatches (e.g., arithmetic on non-integers)
+    ///   - Division by zero
+    ///   - Recursion depth exceeded
+    ///
+    /// ## Supported Expression Types
+    /// - Literals: integers, booleans, strings
+    /// - Variables: identifier lookup, primed variables (`x'`)
+    /// - Operators: unary, binary, user-defined
+    /// - Quantifiers: `\A`, `\E`, `CHOOSE`
+    /// - Sets: enumeration, comprehension, range, operations
+    /// - Sequences: tuple construction, indexing
+    /// - Records: construction, field access, EXCEPT
+    /// - Functions: construction, application
+    /// - Control flow: IF-THEN-ELSE, CASE, LET-IN
     func evaluate(_ expr: TLAExpression, in env: Environment) throws -> TLAValue {
         switch expr {
         case .identifier(let name, _):
@@ -522,6 +551,8 @@ final class TLAInterpreter {
 
         case .choose(let boundVar, let body, _):
             // CHOOSE x \in S : P(x) - pick an arbitrary x satisfying P
+            // Per TLA+ semantics, CHOOSE is a total function: if no value satisfies
+            // the predicate, it returns an unspecified but deterministic value from the domain.
             guard let domain = boundVar.domain else {
                 throw InterpreterError.evaluationError("CHOOSE requires a domain")
             }
@@ -530,6 +561,12 @@ final class TLAInterpreter {
                 throw InterpreterError.typeMismatch(expected: "Set", got: "\(domainVal)")
             }
 
+            // Empty domain is an error - CHOOSE requires at least one element
+            guard let firstElement = domainSet.first else {
+                throw InterpreterError.evaluationError("CHOOSE: domain is empty")
+            }
+
+            // Return first element that satisfies the predicate
             for val in domainSet {
                 var localEnv = env
                 localEnv.variables[boundVar.name] = val
@@ -538,7 +575,10 @@ final class TLAInterpreter {
                     return val
                 }
             }
-            throw InterpreterError.evaluationError("CHOOSE: no value satisfies the predicate")
+
+            // Per TLA+ semantics: if no value satisfies P(x), return an unspecified
+            // but deterministic value. We use the first element of the domain.
+            return firstElement
 
         case .functionConstruction(let boundVars, let body, _):
             // [x \in S |-> expr] - create a function

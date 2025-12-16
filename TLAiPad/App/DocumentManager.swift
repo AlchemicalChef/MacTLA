@@ -97,8 +97,18 @@ final class DocumentManager: ObservableObject {
     }
 
     func saveFile(_ file: TLAFile, in project: TLAProject?) async throws {
-        // For now, files are kept in memory
-        // In a full implementation, this would persist to disk
+        guard let project = project else {
+            // Standalone files require export dialog for initial save
+            throw DocumentError.saveFailed
+        }
+
+        do {
+            _ = try await FileStorage.shared.saveFile(file, in: project)
+        } catch {
+            errorMessage = "Failed to save \(file.name): \(error.localizedDescription)"
+            showError = true
+            throw DocumentError.saveFailed
+        }
     }
 
     private func determineFileType(from url: URL) -> TLAFileType {

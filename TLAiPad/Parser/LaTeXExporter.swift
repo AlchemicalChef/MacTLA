@@ -118,14 +118,15 @@ class LaTeXExporter {
             }
             latex += "\\textsc{instance} \(escapeLatex(d.moduleName))"
             if !d.substitutions.isEmpty {
-                let subs = d.substitutions.map { "\(escapeLatex($0.key)) $\\leftarrow$ \(convertExpression($0.value))" }
+                let subs = d.substitutions.map { "\(escapeLatex($0.parameter)) $\\leftarrow$ \(convertExpression($0.expression))" }
                 latex += " \\textsc{with} \(subs.joined(separator: ", "))"
             }
             latex += "\n"
             return latex
 
         case .specification(let d):
-            return "\(escapeLatex(d.name)) $\\triangleq$ \(convertExpression(d.formula))\n"
+            // SpecificationDeclaration only has name, not a formula
+            return "\\textsc{specification} \(escapeLatex(d.name))\n"
 
         case .invariant(let d):
             return "\\textsc{invariant} \(d.names.map(escapeLatex).joined(separator: ", "))\n"
@@ -166,38 +167,33 @@ class LaTeXExporter {
         case .boolean(let b, _):
             return b ? "\\textsc{true}" : "\\textsc{false}"
 
-        case .set(let elements, _):
+        case .setEnumeration(let elements, _):
             let elems = elements.map { convertExpression($0) }.joined(separator: ", ")
             return "\\{$\(elems)$\\}"
-
-        case .sequence(let elements, _):
-            let elems = elements.map { convertExpression($0) }.joined(separator: ", ")
-            return "$\\langle$\(elems)$\\rangle$"
 
         case .tuple(let elements, _):
             let elems = elements.map { convertExpression($0) }.joined(separator: ", ")
             return "$\\langle$\(elems)$\\rangle$"
 
-        case .record(let fields, _):
-            let fs = fields.map { "\(escapeLatex($0.key)) $\\mapsto$ \(convertExpression($0.value))" }
+        case .recordConstruction(let fields, _):
+            let fs = fields.map { "\(escapeLatex($0.0)) $\\mapsto$ \(convertExpression($0.1))" }
             return "[\(fs.joined(separator: ", "))]"
 
-        case .recordSet(let fields, _):
-            let fs = fields.map { "\(escapeLatex($0.key)): \(convertExpression($0.value))" }
-            return "[\(fs.joined(separator: ", "))]"
+        case .recordAccess(let expr, let field, _):
+            return "\(convertExpression(expr)).\(escapeLatex(field))"
 
-        case .functionDef(let bindings, let body, _):
-            let bs = bindings.map { "\(escapeLatex($0.name)) $\\in$ \(convertExpression($0.set))" }
+        case .functionConstruction(let bindings, let body, _):
+            let bs = bindings.map { "\(convertBoundVariable($0))" }
             return "[\(bs.joined(separator: ", ")) $\\mapsto$ \(convertExpression(body))]"
 
-        case .setComprehension(let expr, let bindings, let predicate, _):
-            let bs = bindings.map { "\(escapeLatex($0.name)) $\\in$ \(convertExpression($0.set))" }
-            var latex = "\\{\(convertExpression(expr)): \(bs.joined(separator: ", "))"
-            if let pred = predicate {
-                latex += ": \(convertExpression(pred))"
-            }
-            latex += "\\}"
-            return latex
+        case .setComprehension(let binding, let predicate, _):
+            return "\\{\(convertBoundVariable(binding)): \(convertExpression(predicate))\\}"
+
+        case .setMap(let mapExpr, let binding, _):
+            return "\\{\(convertExpression(mapExpr)): \(convertBoundVariable(binding))\\}"
+
+        case .setRange(let from, let to, _):
+            return "\(convertExpression(from))..\(convertExpression(to))"
 
         case .binary(let left, let op, let right, _):
             return "(\(convertExpression(left)) \(convertBinaryOp(op)) \(convertExpression(right)))"
@@ -205,13 +201,19 @@ class LaTeXExporter {
         case .unary(let op, let operand, _):
             return "\(convertUnaryOp(op))\(convertExpression(operand))"
 
-        case .quantifier(let kind, let bindings, let body, _):
-            let qs = kind == .forall ? "\\forall" : "\\exists"
-            let bs = bindings.map { "\(escapeLatex($0.name)) $\\in$ \(convertExpression($0.set))" }
-            return "$\(qs)$ \(bs.joined(separator: ", ")): \(convertExpression(body))"
-
-        case .ifThenElse(let cond, let then, let else_, _):
+        case .ternary(let cond, let then, let else_, _):
             return "\\textsc{if} \(convertExpression(cond)) \\textsc{then} \(convertExpression(then)) \\textsc{else} \(convertExpression(else_))"
+
+        case .forall(let bindings, let body, _):
+            let bs = bindings.map { convertBoundVariable($0) }
+            return "$\\forall$ \(bs.joined(separator: ", ")): \(convertExpression(body))"
+
+        case .exists(let bindings, let body, _):
+            let bs = bindings.map { convertBoundVariable($0) }
+            return "$\\exists$ \(bs.joined(separator: ", ")): \(convertExpression(body))"
+
+        case .choose(let binding, let predicate, _):
+            return "\\textsc{choose} \(convertBoundVariable(binding)): \(convertExpression(predicate))"
 
         case .caseExpr(let cases, let other, _):
             var latex = "\\textsc{case} "
@@ -229,14 +231,11 @@ class LaTeXExporter {
             latex += " \\textsc{in} \(convertExpression(body))"
             return latex
 
-        case .functionCall(let func_, let args, _):
+        case .functionApplication(let func_, let args, _):
             let argStr = args.map { convertExpression($0) }.joined(separator: ", ")
             return "\(convertExpression(func_))[\(argStr)]"
 
-        case .choose(let binding, let predicate, _):
-            return "\\textsc{choose} \(escapeLatex(binding.name)) $\\in$ \(convertExpression(binding.set)): \(convertExpression(predicate))"
-
-        case .primed(let expr, _):
+        case .prime(let expr, _):
             return "\(convertExpression(expr))'"
 
         case .unchanged(let expr, _):
@@ -245,36 +244,60 @@ class LaTeXExporter {
         case .enabled(let expr, _):
             return "\\textsc{enabled} \(convertExpression(expr))"
 
-        case .action(let formula, let vars, _):
+        case .stuttering(let formula, let vars, _):
             return "[\(convertExpression(formula))]_{\(convertExpression(vars))}"
 
-        case .temporal(let kind, let formula, _):
-            let op = kind == .always ? "$\\Box$" : "$\\Diamond$"
-            return "\(op)\(convertExpression(formula))"
+        case .action(let formula, let vars, _):
+            return "$\\langle\\langle$\(convertExpression(formula))$\\rangle\\rangle$_{\(convertExpression(vars))}"
 
-        case .leads(let left, let right, _):
+        case .always(let formula, _):
+            return "$\\Box$\(convertExpression(formula))"
+
+        case .eventually(let formula, _):
+            return "$\\Diamond$\(convertExpression(formula))"
+
+        case .leadsto(let left, let right, _):
             return "\(convertExpression(left)) $\\leadsto$ \(convertExpression(right))"
 
-        case .fairness(let kind, let action, let vars, _):
-            let f = kind == .weak ? "WF" : "SF"
-            return "\(f)_{\(convertExpression(vars))}(\(convertExpression(action)))"
+        case .weakFairnessLeadsto(let left, let right, _):
+            return "\(convertExpression(left)) $-+\\rightarrow$ \(convertExpression(right))"
+
+        case .weakFairness(let vars, let action, _):
+            return "WF_{\(convertExpression(vars))}(\(convertExpression(action)))"
+
+        case .strongFairness(let vars, let action, _):
+            return "SF_{\(convertExpression(vars))}(\(convertExpression(action)))"
 
         case .except(let expr, let updates, _):
-            let us = updates.map { "!\(convertExpression($0.path)) = \(convertExpression($0.value))" }
+            let us = updates.map { "!\(convertExceptPath($0.path)) = \(convertExpression($0.value))" }
             return "[\(convertExpression(expr)) \\textsc{except} \(us.joined(separator: ", "))]"
 
-        case .domain(let expr, _):
-            return "\\textsc{domain} \(convertExpression(expr))"
-
-        case .subset(let expr, _):
-            return "\\textsc{subset} \(convertExpression(expr))"
-
-        case .union(let expr, _):
-            return "\\textsc{union} \(convertExpression(expr))"
-
-        case .subsetOf(let binding, let predicate, _):
-            return "\\{\(escapeLatex(binding.name)) $\\in$ \(convertExpression(binding.set)): \(convertExpression(predicate))\\}"
+        case .lambda(let params, let body, _):
+            let ps = params.map(escapeLatex).joined(separator: ", ")
+            return "\\textsc{lambda} \(ps): \(convertExpression(body))"
         }
+    }
+
+    // MARK: - Bound Variable Conversion
+
+    private func convertBoundVariable(_ bv: BoundVariable) -> String {
+        let name: String
+        switch bv.pattern {
+        case .single(let n):
+            name = escapeLatex(n)
+        case .tuple(let names):
+            name = "$\\langle$\(names.map(escapeLatex).joined(separator: ", "))$\\rangle$"
+        }
+
+        if let domain = bv.domain {
+            return "\(name) $\\in$ \(convertExpression(domain))"
+        } else {
+            return name
+        }
+    }
+
+    private func convertExceptPath(_ path: [TLAExpression]) -> String {
+        return path.map { convertExpression($0) }.joined(separator: "][")
     }
 
     // MARK: - Operator Conversion
@@ -336,6 +359,18 @@ class LaTeXExporter {
         case .sqcup: return "$\\sqcup$"
         case .sqsubseteq: return "$\\sqsubseteq$"
         case .sqsupseteq: return "$\\sqsupseteq$"
+        // Circle operators
+        case .oplus: return "$\\oplus$"
+        case .ominus: return "$\\ominus$"
+        case .otimes: return "$\\otimes$"
+        case .oslash: return "$\\oslash$"
+        case .odot: return "$\\odot$"
+        // Other mathematical operators
+        case .cdot: return "$\\cdot$"
+        case .bullet: return "$\\bullet$"
+        case .star: return "$\\star$"
+        case .bigcirc: return "$\\bigcirc$"
+        case .wr: return "$\\wr$"
         }
     }
 

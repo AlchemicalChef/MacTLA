@@ -629,7 +629,11 @@ final class TLALexer {
             let text = String(source[start..<current])
             if text == "WF_" || text == "SF_" {
                 // Stop here - emit the keyword and let the next scan handle the rest
-                addToken(.keyword(TLAKeyword(rawValue: text)!))
+                if let keyword = TLAKeyword(rawValue: text) {
+                    addToken(.keyword(keyword))
+                } else {
+                    addToken(.identifier(text))
+                }
                 return
             }
         }

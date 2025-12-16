@@ -299,8 +299,8 @@ struct EditorTextView: NSViewRepresentable {
 
             // Get click location in text
             let location = recognizer.location(in: textView)
-            let textContainer = textView.textContainer!
-            let layoutManager = textView.layoutManager!
+            guard let textContainer = textView.textContainer,
+                  let layoutManager = textView.layoutManager else { return }
 
             var fraction: CGFloat = 0
             let characterIndex = layoutManager.characterIndex(

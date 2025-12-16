@@ -1,6 +1,7 @@
 import SwiftUI
 
 /// User settings for the TLA+ toolbox
+@MainActor
 final class AppSettings: ObservableObject {
     static let shared = AppSettings()
 

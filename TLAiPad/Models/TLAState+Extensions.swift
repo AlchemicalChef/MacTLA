@@ -33,14 +33,13 @@ extension TLAValue {
         case .function: return "Function"
         case .record: return "Record"
         case .modelValue: return "ModelValue"
-        case .tuple: return "Tuple"
         }
     }
 
-    /// Checks if this value is a collection type (set, sequence, or tuple)
+    /// Checks if this value is a collection type (set or sequence)
     var isCollection: Bool {
         switch self {
-        case .set, .sequence, .tuple:
+        case .set, .sequence:
             return true
         default:
             return false
@@ -52,7 +51,7 @@ extension TLAValue {
         switch self {
         case .set(let elements):
             return elements.count
-        case .sequence(let elements), .tuple(let elements):
+        case .sequence(let elements):
             return elements.count
         case .function(let map):
             return map.count

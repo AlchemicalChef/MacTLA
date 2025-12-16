@@ -120,6 +120,41 @@ actor ModelChecker {
         let name: String  // Name of the symmetry set (e.g., "Permutations(Nodes)")
     }
 
+    /// Verifies a TLA+ specification using explicit-state model checking.
+    ///
+    /// This method performs breadth-first state space exploration to verify that the
+    /// specification satisfies all specified invariants and properties. It supports:
+    /// - Invariant checking (safety properties)
+    /// - Deadlock detection
+    /// - Temporal property verification (liveness with fairness)
+    /// - Symmetry reduction for state space optimization
+    ///
+    /// - Parameters:
+    ///   - specification: The TLA+ source code to verify
+    ///   - config: Model checking configuration (max states, depth, parallelism)
+    ///   - constants: Constant value overrides for parameterized specs
+    ///   - invariants: Invariant predicates to check in every reachable state
+    ///   - properties: Temporal properties to verify (always, eventually, fairness)
+    ///   - constraints: State constraints to limit exploration
+    ///   - actionConstraints: Action constraints (can reference primed variables)
+    ///   - view: View specification for state projection
+    ///   - symmetrySets: Symmetry sets for symmetry reduction optimization
+    ///
+    /// - Returns: A `VerificationResult` containing:
+    ///   - Verification status (success, failure, error, cancelled)
+    ///   - Statistics (states explored, time elapsed)
+    ///   - Counterexample trace if an invariant was violated
+    ///   - Error message if parsing or evaluation failed
+    ///
+    /// ## Example
+    /// ```swift
+    /// let checker = ModelChecker()
+    /// let result = await checker.verify(
+    ///     specification: mySpec,
+    ///     config: .default,
+    ///     invariants: [InvariantSpec(name: "TypeOK")]
+    /// )
+    /// ```
     func verify(
         specification: String,
         config: Configuration = .default,

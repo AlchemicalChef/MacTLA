@@ -2,12 +2,16 @@ import SwiftUI
 
 /// Visualizes the state space as an interactive graph
 struct StateGraphView: View {
+    // MARK: - Properties
+
     let states: [GraphState]
     let transitions: [GraphTransition]
     @State private var selectedState: GraphState?
     @State private var scale: CGFloat = 1.0
     @State private var offset: CGSize = .zero
     @GestureState private var dragOffset: CGSize = .zero
+
+    // MARK: - Body
 
     var body: some View {
         GeometryReader { geometry in
@@ -154,12 +158,16 @@ struct StateGraphView: View {
         .navigationTitle("State Graph")
     }
 
+    // MARK: - Computed Properties
+
     private var totalOffset: CGSize {
         CGSize(
             width: offset.width + dragOffset.width,
             height: offset.height + dragOffset.height
         )
     }
+
+    // MARK: - Private Methods
 
     private func position(for state: GraphState, center: CGPoint, scale: CGFloat, offset: CGSize) -> CGPoint {
         CGPoint(
@@ -221,6 +229,8 @@ struct StateGraphView: View {
         }
     }
 }
+
+// MARK: - Supporting Views
 
 struct LegendItem: View {
     let color: Color

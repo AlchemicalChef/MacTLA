@@ -150,6 +150,9 @@ schemes:
       config: Debug
     test:
       config: Debug
+      gatherCoverageData: true
+      coverageTargets:
+        - MacTLA
       targets:
         - MacTLATests
     profile:

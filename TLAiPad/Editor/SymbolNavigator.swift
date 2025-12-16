@@ -720,7 +720,7 @@ struct RenameSymbolView: View {
 
                     Text(validation.message ?? "")
                         .font(.caption)
-                        .foregroundStyle(validation.isValid ? .secondary : .red)
+                        .foregroundColor(validation.isValid ? .secondary : .red)
                 }
             }
 

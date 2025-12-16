@@ -6,6 +6,8 @@ final class TLASyntaxHighlighter {
 
     private init() {}
 
+    // MARK: - Theme Configuration
+
     struct HighlightTheme {
         var keyword: Color = .purple
         var `operator`: Color = .blue
@@ -44,6 +46,8 @@ final class TLASyntaxHighlighter {
         case italic
     }
 
+    // MARK: - Public Methods
+
     func highlight(_ source: String, theme: HighlightTheme = .default) -> AttributedString {
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
@@ -71,6 +75,8 @@ final class TLASyntaxHighlighter {
 
         return attributedString
     }
+
+    // MARK: - Private Methods
 
     private func characterOffset(for token: TLAToken, in source: String) -> Int {
         var offset = 0

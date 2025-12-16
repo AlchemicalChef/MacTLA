@@ -1,10 +1,13 @@
 import Foundation
 import SwiftUI
+import os.log
 
 /// Handles file storage and iCloud sync for TLA+ specifications
 @MainActor
 final class FileStorage: ObservableObject {
     static let shared = FileStorage()
+
+    private static let logger = Logger(subsystem: "com.tlaplus.MacTLA", category: "FileStorage")
 
     @Published var isCloudAvailable = false
     @Published var isSyncing = false
@@ -64,11 +67,16 @@ final class FileStorage: ObservableObject {
     }
 
     func loadRecentFiles() {
-        guard let data = try? Data(contentsOf: recentFilesURL),
-              let files = try? JSONDecoder().decode([RecentFile].self, from: data) else {
-            return
+        do {
+            let data = try Data(contentsOf: recentFilesURL)
+            let files = try JSONDecoder().decode([RecentFile].self, from: data)
+            recentFiles = files.sorted { $0.lastOpened > $1.lastOpened }
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {
+            // File doesn't exist yet - this is normal on first launch
+            Self.logger.debug("Recent files not found (first launch)")
+        } catch {
+            Self.logger.error("Failed to load recent files: \(error.localizedDescription)")
         }
-        recentFiles = files.sorted { $0.lastOpened > $1.lastOpened }
     }
 
     func addToRecentFiles(_ file: TLAFile, path: String, isCloud: Bool) {
