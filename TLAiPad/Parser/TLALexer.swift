@@ -344,13 +344,14 @@ final class TLALexer {
                     scanLineComment()
                 }
             } else if match("+") {
+                // Check for -+-> (weak fairness leadsto)
                 if match("-") && match(">") {
                     addToken(.operator(.weakFairnessLeadsto))  // -+->
                 } else {
-                    // Backtrack - we consumed + but it's not -+->
-                    // This is an error case, treat as minus followed by plus
-                    current = source.index(before: current)  // Put back the +
-                    column -= 1
+                    // Backtrack - restore position after the + and emit just minus
+                    // The + will be scanned on the next iteration
+                    current = source.index(after: start)  // Position after the initial -
+                    column = startColumn + 1
                     addToken(.operator(.minus))
                 }
             } else if match(">") {

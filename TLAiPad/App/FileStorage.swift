@@ -44,6 +44,33 @@ final class FileStorage: ObservableObject {
         loadRecentFiles()
     }
 
+    // MARK: - File Name Sanitization
+
+    /// Sanitizes a file name to prevent path traversal attacks
+    private func sanitizeFileName(_ name: String) -> String {
+        // Remove path traversal sequences and path separators
+        var sanitized = name
+            .replacingOccurrences(of: "..", with: "")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "\\", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Ensure we have a valid file name
+        if sanitized.isEmpty {
+            sanitized = "untitled"
+        }
+
+        // Limit length to prevent filesystem issues
+        if sanitized.count > 255 {
+            let ext = (sanitized as NSString).pathExtension
+            let base = (sanitized as NSString).deletingPathExtension
+            let maxBase = 255 - ext.count - 1 // -1 for the dot
+            sanitized = String(base.prefix(maxBase)) + "." + ext
+        }
+
+        return sanitized
+    }
+
     // MARK: - Cloud Availability
 
     private func checkCloudAvailability() {
@@ -141,9 +168,10 @@ final class FileStorage: ObservableObject {
         let metadataData = try JSONEncoder().encode(metadata)
         try metadataData.write(to: metadataURL)
 
-        // Save each file
+        // Save each file with sanitized names
         for file in project.files {
-            let fileURL = projectURL.appendingPathComponent(file.name)
+            let safeName = sanitizeFileName(file.name)
+            let fileURL = projectURL.appendingPathComponent(safeName)
             try file.content.write(to: fileURL, atomically: true, encoding: .utf8)
         }
     }
@@ -157,10 +185,11 @@ final class FileStorage: ObservableObject {
 
         var files: [TLAFile] = []
         for fileName in metadata.fileNames {
-            let fileURL = projectURL.appendingPathComponent(fileName)
+            let safeName = sanitizeFileName(fileName)
+            let fileURL = projectURL.appendingPathComponent(safeName)
             let content = try String(contentsOf: fileURL, encoding: .utf8)
-            let fileType: TLAFileType = fileName.hasSuffix(".cfg") ? .model : .specification
-            files.append(TLAFile(name: fileName, type: fileType, content: content))
+            let fileType: TLAFileType = safeName.hasSuffix(".cfg") ? .model : .specification
+            files.append(TLAFile(name: safeName, type: fileType, content: content))
         }
 
         return TLAProject(

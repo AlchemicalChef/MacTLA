@@ -32,6 +32,10 @@ final class TLAInterpreter {
         }
     }
 
+    /// Extracted variable domains from TypeOK or similar type invariants
+    /// Used by ENABLED for exhaustive search over declared domains
+    private var variableDomains: [String: TLAValue] = [:]
+
     /// Sets a constant value from configuration
     /// - Parameters:
     ///   - name: The constant name
@@ -41,6 +45,45 @@ final class TLAInterpreter {
         if let value = parseConstantValue(valueString) {
             constantOverrides[name] = value
         }
+    }
+
+    /// Loads a module's definitions into an environment
+    /// This populates the environment with the module's operators, constants, and built-ins
+    /// - Parameters:
+    ///   - module: The TLA+ module to load
+    ///   - env: The environment to populate (passed by reference)
+    func loadModule(_ module: TLAModule, into env: inout Environment) throws {
+        for decl in module.declarations {
+            switch decl {
+            case .operatorDef(let def):
+                env.operators[def.name] = def
+            case .constant(let constDecl):
+                // Initialize constants - use override if available, otherwise model value
+                for name in constDecl.names {
+                    if let overrideValue = constantOverrides[name] {
+                        env.constants[name] = overrideValue
+                    } else {
+                        env.constants[name] = .modelValue(name)
+                    }
+                }
+            case .instance(let instanceDecl):
+                // Handle INSTANCE declarations using ModuleRegistry
+                do {
+                    try ModuleRegistry.shared.instantiate(instanceDecl, into: &env, module: module)
+                } catch {
+                    // Log error but continue - standard modules are handled as built-ins
+                    print("Warning: Could not instantiate module \(instanceDecl.moduleName): \(error)")
+                }
+            default:
+                break
+            }
+        }
+
+        // Add built-in operators
+        addBuiltins(to: &env)
+
+        // Extract variable domains from TypeOK for ENABLED exhaustive search
+        extractVariableDomainsFromModule(module, env: env)
     }
 
     /// Parses a constant value string into a TLAValue
@@ -493,6 +536,12 @@ final class TLAInterpreter {
             if l > h {
                 return .set([])
             }
+            // Limit range size to prevent memory exhaustion
+            let rangeSize = h - l + 1
+            let maxRangeSize = 100_000
+            guard rangeSize <= maxRangeSize else {
+                throw InterpreterError.evaluationError("Set range \(l)..\(h) would create \(rangeSize) elements - limit is \(maxRangeSize)")
+            }
             return .set(Set((l...h).map { TLAValue.integer($0) }))
 
         case .functionApplication(let func_, let args, _):
@@ -700,6 +749,7 @@ final class TLAInterpreter {
 
             // Per TLA+ semantics: if no value satisfies P(x), return an unspecified
             // but deterministic value. We use the first element of the sorted domain.
+            print("Warning: CHOOSE found no element satisfying predicate, returning first element of domain: \(firstElement)")
             return firstElement
 
         case .functionConstruction(let boundVars, let body, _):
@@ -748,41 +798,16 @@ final class TLAInterpreter {
             return .function(function)
 
         case .except(let base, let clauses, _):
-            // [f EXCEPT ![x] = v] - functional update
-            let baseVal = try evaluate(base, in: env)
+            // [f EXCEPT ![x] = v] or [f EXCEPT ![x][y] = v] - functional update with nested paths
+            var result = try evaluate(base, in: env)
 
-            switch baseVal {
-            case .function(var f):
-                for clause in clauses {
-                    guard let firstPath = clause.path.first else { continue }
-                    let key = try evaluate(firstPath, in: env)
-                    let value = try evaluate(clause.value, in: env)
-                    f[key] = value
-                }
-                return .function(f)
-
-            case .record(var r):
-                for clause in clauses {
-                    guard let firstPath = clause.path.first,
-                          case .string(let field) = try evaluate(firstPath, in: env) else { continue }
-                    let value = try evaluate(clause.value, in: env)
-                    r[field] = value
-                }
-                return .record(r)
-
-            case .sequence(var seq):
-                for clause in clauses {
-                    guard let firstPath = clause.path.first,
-                          case .integer(let idx) = try evaluate(firstPath, in: env),
-                          idx >= 1, idx <= seq.count else { continue }
-                    let value = try evaluate(clause.value, in: env)
-                    seq[idx - 1] = value
-                }
-                return .sequence(seq)
-
-            default:
-                throw InterpreterError.typeMismatch(expected: "Function/Record/Sequence", got: "\(baseVal)")
+            for clause in clauses {
+                guard !clause.path.isEmpty else { continue }
+                let value = try evaluate(clause.value, in: env)
+                result = try applyExceptClause(to: result, path: clause.path, value: value, env: env)
             }
+
+            return result
 
         case .recordAccess(let record, let field, _):
             let recordVal = try evaluate(record, in: env)
@@ -952,7 +977,15 @@ final class TLAInterpreter {
                 guard r != 0 else {
                     throw InterpreterError.evaluationError("Division by zero")
                 }
-                return .integer(l / r)
+                // TLA+ uses floor division (truncate toward negative infinity)
+                // Swift's / truncates toward zero, so we need to adjust for negative results
+                let quotient = l / r
+                let remainder = l % r
+                // Adjust when signs differ and there's a remainder
+                if remainder != 0 && (l < 0) != (r < 0) {
+                    return .integer(quotient - 1)
+                }
+                return .integer(quotient)
             case .mod:
                 guard r != 0 else {
                     throw InterpreterError.evaluationError("Modulo by zero")
@@ -1041,7 +1074,14 @@ final class TLAInterpreter {
                   case .set(let r) = rightVal else {
                 throw InterpreterError.typeMismatch(expected: "Set", got: "non-set")
             }
+            // Limit Cartesian product size to prevent memory exhaustion
+            let productSize = l.count * r.count
+            let maxProductSize = 1_000_000
+            guard productSize <= maxProductSize else {
+                throw InterpreterError.evaluationError("Cartesian product of sets with \(l.count) and \(r.count) elements would create \(productSize) tuples - limit is \(maxProductSize)")
+            }
             var result: Set<TLAValue> = []
+            result.reserveCapacity(productSize)
             for a in l {
                 for b in r {
                     result.insert(.sequence([a, b]))
@@ -1083,6 +1123,11 @@ final class TLAInterpreter {
                 result[key] = value
             }
             return .function(result)
+
+        case .colonGreater:
+            // TLC module: x :> y creates function [z \in {x} |-> y]
+            // This is equivalent to (x :> y) = [z \in {x} |-> y]
+            return .function([leftVal: rightVal])
 
         // Relational operators - return boolean for comparison
         case .prec, .preceq, .succ, .succeq:
@@ -1286,30 +1331,47 @@ final class TLAInterpreter {
     /// that makes the action predicate true.
     private func evaluateEnabled(_ actionExpr: TLAExpression, in env: Environment) throws -> TLAValue {
         // Get current variable names (non-primed)
-        let currentVars = env.variables.keys.filter { !$0.hasSuffix("'") }
+        let currentVars = Array(env.variables.keys.filter { !$0.hasSuffix("'") })
 
-        // Generate possible assignments to primed variables
-        // We use the same values as current state plus neighbors
-        var possibleValues: Set<TLAValue> = []
-        for (_, value) in env.variables {
-            possibleValues.insert(value)
-            // Add neighboring values for integers
-            if case .integer(let n) = value {
-                possibleValues.insert(.integer(n + 1))
-                possibleValues.insert(.integer(n - 1))
+        // Build per-variable domain maps for exhaustive search
+        // Use extracted domains from TypeOK when available
+        var varDomains: [String: [TLAValue]] = [:]
+        var totalSearchSpace = 1
+        let maxSearchSpace = 100_000  // Limit to prevent memory explosion
+
+        for varName in currentVars {
+            if let domain = variableDomains[varName], case .set(let domainSet) = domain {
+                // Use extracted domain from TypeOK
+                varDomains[varName] = Array(domainSet)
+                totalSearchSpace *= max(1, domainSet.count)
+            } else {
+                // Fallback: use current value + neighbors + defaults
+                var fallbackValues: Set<TLAValue> = [
+                    .boolean(true), .boolean(false),
+                    .integer(0), .integer(1)
+                ]
+                if let currentValue = env.variables[varName] {
+                    fallbackValues.insert(currentValue)
+                    if case .integer(let n) = currentValue {
+                        fallbackValues.insert(.integer(n + 1))
+                        fallbackValues.insert(.integer(n - 1))
+                    }
+                }
+                varDomains[varName] = Array(fallbackValues)
+                totalSearchSpace *= fallbackValues.count
+            }
+
+            // Check search space limit after each variable
+            if totalSearchSpace > maxSearchSpace {
+                throw InterpreterError.evaluationError(
+                    "ENABLED search space too large (\(totalSearchSpace) states) - consider smaller TypeOK domains"
+                )
             }
         }
-        // Add common defaults
-        possibleValues.insert(.boolean(true))
-        possibleValues.insert(.boolean(false))
-        possibleValues.insert(.integer(0))
-        possibleValues.insert(.integer(1))
-
-        let possibleValuesArray = Array(possibleValues)
 
         // Try all combinations of primed variable assignments
-        func tryAssignments(vars: [String], currentEnv: Environment) -> Bool {
-            guard let varName = vars.first else {
+        func tryAssignments(varIndex: Int, currentEnv: Environment) -> Bool {
+            guard varIndex < currentVars.count else {
                 // All primed variables assigned, evaluate the action
                 do {
                     let result = try evaluate(actionExpr, in: currentEnv)
@@ -1322,20 +1384,22 @@ final class TLAInterpreter {
                 return false
             }
 
-            let remaining = Array(vars.dropFirst())
+            let varName = currentVars[varIndex]
             let primedName = varName + "'"
+            let domain = varDomains[varName] ?? []
 
-            for value in possibleValuesArray {
+            for value in domain {
                 var newEnv = currentEnv
                 newEnv.variables[primedName] = value
-                if tryAssignments(vars: remaining, currentEnv: newEnv) {
+                newEnv.primedVariables[varName] = value  // Sync for UNCHANGED support
+                if tryAssignments(varIndex: varIndex + 1, currentEnv: newEnv) {
                     return true
                 }
             }
             return false
         }
 
-        let isEnabled = tryAssignments(vars: Array(currentVars), currentEnv: env)
+        let isEnabled = tryAssignments(varIndex: 0, currentEnv: env)
         return .boolean(isEnabled)
     }
 
@@ -1443,20 +1507,22 @@ final class TLAInterpreter {
             }
             // TLA+ SubSeq(s, m, n) returns s[m..n] (1-indexed, inclusive)
             // Per TLA+ semantics:
+            // - If m < 1, undefined (we throw an error)
             // - If m > n, returns <<>>
-            // - If m < 1, clamp to 1
             // - If n > Len(s), clamp to Len(s)
             // - If m > Len(s), returns <<>>
+            if m < 1 {
+                throw InterpreterError.evaluationError("SubSeq: starting index m must be >= 1, got \(m)")
+            }
             if m > n {
                 return .sequence([])
             }
-            let clampedM = max(1, m)
             let clampedN = min(n, seq.count)
-            if clampedM > seq.count {
+            if m > seq.count {
                 return .sequence([])
             }
-            // Convert to 0-indexed: [clampedM-1, clampedN-1] inclusive = [clampedM-1, clampedN) in Swift
-            return .sequence(Array(seq[(clampedM-1)..<clampedN]))
+            // Convert to 0-indexed: [m-1, clampedN-1] inclusive = [m-1, clampedN) in Swift
+            return .sequence(Array(seq[(m-1)..<clampedN]))
 
         case "SelectSeq":
             guard args.count == 2 else {
@@ -1604,16 +1670,14 @@ final class TLAInterpreter {
             guard !s.isEmpty else {
                 throw InterpreterError.evaluationError("Min of empty set is undefined")
             }
-            var minVal: Int?
+            var minVal: Int = Int.max
             for elem in s {
                 guard case .integer(let i) = elem else {
                     throw InterpreterError.typeMismatch(expected: "Integer", got: "\(elem)")
                 }
-                if minVal == nil || i < minVal! {
-                    minVal = i
-                }
+                minVal = min(minVal, i)
             }
-            return .integer(minVal!)
+            return .integer(minVal)
 
         case "Max":
             // Max(S) - maximum element of a set of integers
@@ -1627,16 +1691,14 @@ final class TLAInterpreter {
             guard !s.isEmpty else {
                 throw InterpreterError.evaluationError("Max of empty set is undefined")
             }
-            var maxVal: Int?
+            var maxVal: Int = Int.min
             for elem in s {
                 guard case .integer(let i) = elem else {
                     throw InterpreterError.typeMismatch(expected: "Integer", got: "\(elem)")
                 }
-                if maxVal == nil || i > maxVal! {
-                    maxVal = i
-                }
+                maxVal = max(maxVal, i)
             }
-            return .integer(maxVal!)
+            return .integer(maxVal)
 
         case "ToString":
             // ToString(v) - convert value to string representation
@@ -1761,38 +1823,77 @@ final class TLAInterpreter {
 
     // MARK: - Helpers
 
-    private func buildEnvironment(from module: TLAModule) -> Environment {
-        var env = Environment()
-
-        for decl in module.declarations {
-            switch decl {
-            case .operatorDef(let def):
-                env.operators[def.name] = def
-            case .constant(let constDecl):
-                // Initialize constants - use override if available, otherwise model value
-                for name in constDecl.names {
-                    if let overrideValue = constantOverrides[name] {
-                        env.constants[name] = overrideValue
-                    } else {
-                        env.constants[name] = .modelValue(name)
-                    }
-                }
-            case .instance(let instanceDecl):
-                // Handle INSTANCE declarations using ModuleRegistry
-                do {
-                    try ModuleRegistry.shared.instantiate(instanceDecl, into: &env, module: module)
-                } catch {
-                    // Log error but continue - standard modules are handled as built-ins
-                    print("Warning: Could not instantiate module \(instanceDecl.moduleName): \(error)")
-                }
-            default:
-                break
-            }
+    /// Recursively applies an EXCEPT update through nested paths
+    /// Supports [f EXCEPT ![x][y] = v] syntax for nested function/record/sequence updates
+    private func applyExceptClause(
+        to base: TLAValue,
+        path: [TLAExpression],
+        value: TLAValue,
+        env: Environment,
+        depth: Int = 0
+    ) throws -> TLAValue {
+        // Recursion depth protection
+        guard depth < Self.maxRecursionDepth else {
+            throw InterpreterError.evaluationError("EXCEPT: maximum nesting depth exceeded (\(Self.maxRecursionDepth))")
         }
 
-        // Add built-in operators
-        addBuiltins(to: &env)
+        guard let firstKeyExpr = path.first else {
+            // End of path - return the new value
+            return value
+        }
 
+        let key = try evaluate(firstKeyExpr, in: env)
+        let remainingPath = Array(path.dropFirst())
+
+        switch base {
+        case .function(var f):
+            if remainingPath.isEmpty {
+                // Last path element - update directly
+                f[key] = value
+            } else {
+                // Recurse into nested structure
+                guard let nested = f[key] else {
+                    throw InterpreterError.evaluationError("EXCEPT: path not found for key \(key)")
+                }
+                f[key] = try applyExceptClause(to: nested, path: remainingPath, value: value, env: env, depth: depth + 1)
+            }
+            return .function(f)
+
+        case .record(var r):
+            guard case .string(let field) = key else {
+                throw InterpreterError.typeMismatch(expected: "String key for record", got: "\(key)")
+            }
+            if remainingPath.isEmpty {
+                r[field] = value
+            } else {
+                guard let nested = r[field] else {
+                    throw InterpreterError.evaluationError("EXCEPT: field '\(field)' not found")
+                }
+                r[field] = try applyExceptClause(to: nested, path: remainingPath, value: value, env: env, depth: depth + 1)
+            }
+            return .record(r)
+
+        case .sequence(var seq):
+            guard case .integer(let idx) = key, idx >= 1, idx <= seq.count else {
+                throw InterpreterError.evaluationError("EXCEPT: sequence index out of bounds")
+            }
+            if remainingPath.isEmpty {
+                seq[idx - 1] = value
+            } else {
+                let nested = seq[idx - 1]
+                seq[idx - 1] = try applyExceptClause(to: nested, path: remainingPath, value: value, env: env, depth: depth + 1)
+            }
+            return .sequence(seq)
+
+        default:
+            throw InterpreterError.typeMismatch(expected: "Function/Record/Sequence", got: "\(base)")
+        }
+    }
+
+    private func buildEnvironment(from module: TLAModule) -> Environment {
+        var env = Environment()
+        // Use loadModule to populate the environment (reuses the same logic)
+        try? loadModule(module, into: &env)
         return env
     }
 
@@ -1804,6 +1905,155 @@ final class TLAInterpreter {
 
         // Booleans
         env.constants["BOOLEAN"] = .set([.boolean(true), .boolean(false)])
+    }
+
+    /// Extracts variable domains from a type invariant like TypeOK
+    /// TypeOK == x \in {0,1,2} /\ y \in BOOLEAN /\ z \in Nat
+    /// Returns a dictionary mapping variable names to their domain sets
+    private func extractDomainsFromTypeInvariant(_ expr: TLAExpression, env: Environment) -> [String: TLAValue] {
+        var domains: [String: TLAValue] = [:]
+
+        switch expr {
+        case .binary(let left, .and, let right, _):
+            // Conjunction: recurse on both sides
+            let leftDomains = extractDomainsFromTypeInvariant(left, env: env)
+            let rightDomains = extractDomainsFromTypeInvariant(right, env: env)
+            domains.merge(leftDomains) { _, new in new }
+            domains.merge(rightDomains) { _, new in new }
+
+        case .binary(let left, .elementOf, let right, _):
+            // x \in S - extract variable name and domain
+            if case .identifier(let varName, _) = left {
+                // Skip complex expressions that could cause combinatorial explosion
+                // E.g., [S -> [S -> 0..500]] creates billions of entries
+                if couldCauseExplosion(right) {
+                    print("Info: Skipping domain extraction for '\(varName)' - complex expression could cause memory explosion")
+                    break
+                }
+
+                // Try to evaluate the set expression
+                do {
+                    let domainValue = try evaluate(right, in: env)
+                    if case .set(let s) = domainValue {
+                        // Only store reasonably-sized domains
+                        if s.count <= 100_000 {
+                            domains[varName] = domainValue
+                        } else {
+                            print("Info: Skipping domain for '\(varName)' - set too large (\(s.count) elements)")
+                        }
+                    } else {
+                        print("Warning: TypeOK domain for '\(varName)' is not a set: \(domainValue)")
+                    }
+                } catch {
+                    print("Warning: Failed to extract TypeOK domain for '\(varName)': \(error)")
+                }
+            }
+
+        default:
+            // Other expressions (OR, implies, etc.) don't contribute to domain extraction
+            // Log if we encounter complex patterns that might be TypeOK constraints
+            break
+        }
+
+        return domains
+    }
+
+    /// Checks if an expression could cause combinatorial explosion when evaluated.
+    /// This detects patterns like nested function constructions, large set ranges, etc.
+    private func couldCauseExplosion(_ expr: TLAExpression) -> Bool {
+        switch expr {
+        case .functionConstruction(let boundVars, let body, _):
+            // Nested function constructions are dangerous
+            if containsFunctionConstruction(body) {
+                return true
+            }
+            // Check if any domain is itself a function construction
+            for bv in boundVars {
+                if let domain = bv.domain, couldCauseExplosion(domain) {
+                    return true
+                }
+            }
+            // Large ranges in function domains are dangerous
+            for bv in boundVars {
+                if let domain = bv.domain, hasLargeRange(domain) {
+                    return true
+                }
+            }
+            return false
+
+        case .binary(let left, .cartesian, let right, _):
+            // Cartesian products can explode
+            return couldCauseExplosion(left) || couldCauseExplosion(right)
+
+        case .setRange(let start, let end, _):
+            // Check if range is large
+            if case .number(let s, _) = start, case .number(let e, _) = end {
+                return abs(e - s) > 100
+            }
+            return false
+
+        case .binary(let left, _, let right, _):
+            // Check both sides of binary expressions
+            return couldCauseExplosion(left) || couldCauseExplosion(right)
+
+        case .unary(_, let operand, _):
+            return couldCauseExplosion(operand)
+
+        default:
+            return false
+        }
+    }
+
+    /// Checks if an expression contains a function construction (helper for explosion detection)
+    private func containsFunctionConstruction(_ expr: TLAExpression) -> Bool {
+        switch expr {
+        case .functionConstruction:
+            return true
+        case .binary(let left, _, let right, _):
+            return containsFunctionConstruction(left) || containsFunctionConstruction(right)
+        case .unary(_, let operand, _):
+            return containsFunctionConstruction(operand)
+        case .ternary(let cond, let thenBr, let elseBr, _):
+            return containsFunctionConstruction(cond) ||
+                   containsFunctionConstruction(thenBr) ||
+                   containsFunctionConstruction(elseBr)
+        default:
+            return false
+        }
+    }
+
+    /// Checks if an expression contains a large set range (> 100 elements)
+    private func hasLargeRange(_ expr: TLAExpression) -> Bool {
+        switch expr {
+        case .setRange(let start, let end, _):
+            if case .number(let s, _) = start, case .number(let e, _) = end {
+                return abs(e - s) > 100
+            }
+            return true // Conservatively assume large for non-literal ranges
+        case .binary(let left, _, let right, _):
+            return hasLargeRange(left) || hasLargeRange(right)
+        case .identifier(let name, _):
+            // Known large sets
+            let largeBuiltins = ["Nat", "Int", "Real", "STRING"]
+            return largeBuiltins.contains(name)
+        default:
+            return false
+        }
+    }
+
+    /// Finds and extracts variable domains from TypeOK or TypeInvariant operator
+    private func extractVariableDomainsFromModule(_ module: TLAModule, env: Environment) {
+        // Look for TypeOK or TypeInvariant operator
+        for decl in module.declarations {
+            if case .operatorDef(let def) = decl {
+                let name = def.name.lowercased()
+                if name == "typeok" || name == "typeinvariant" || name == "typeinv" {
+                    // Found a type invariant - extract domains from its body
+                    let domains = extractDomainsFromTypeInvariant(def.body, env: env)
+                    variableDomains.merge(domains) { _, new in new }
+                }
+            }
+        }
     }
 
     private func extractVariables(from module: TLAModule) -> [String] {

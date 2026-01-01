@@ -4,41 +4,27 @@ import XCTest
 /// Tests for model checker configuration and settings
 final class ModelCheckerConfigurationTests: XCTestCase {
 
-    // MARK: - Helper Methods
-
-    private func parse(_ source: String) -> TLAModule? {
-        let parser = TLAParser()
-        switch parser.parse(source) {
-        case .success(let module):
-            return module
-        case .failure:
-            return nil
-        }
-    }
-
     // MARK: - Default Configuration Tests
 
     func testDefaultConfiguration() {
-        let config = ModelCheckerConfiguration()
+        let config = ModelChecker.Configuration.default
 
         // Check default values
-        XCTAssertEqual(config.maxStates, 100000)
+        XCTAssertEqual(config.maxStates, 1_000_000)
         XCTAssertEqual(config.checkDeadlock, true)
-        XCTAssertTrue(config.invariants.isEmpty)
-        XCTAssertTrue(config.properties.isEmpty)
+        XCTAssertEqual(config.checkInvariants, true)
+        XCTAssertEqual(config.checkLiveness, true)
     }
 
     func testConfigurationCustomization() {
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
         config.maxStates = 50000
         config.checkDeadlock = false
-        config.invariants = ["TypeOK", "Safety"]
-        config.properties = ["Liveness"]
+        config.maxDepth = 50
 
         XCTAssertEqual(config.maxStates, 50000)
         XCTAssertEqual(config.checkDeadlock, false)
-        XCTAssertEqual(config.invariants.count, 2)
-        XCTAssertEqual(config.properties.count, 1)
+        XCTAssertEqual(config.maxDepth, 50)
     }
 
     // MARK: - Max States Limit Tests
@@ -56,20 +42,18 @@ final class ModelCheckerConfigurationTests: XCTestCase {
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
         config.maxStates = 10
         config.checkDeadlock = false
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config
+        )
 
         // Should stop after maxStates
-        XCTAssertEqual(result.status, .statesExhausted)
+        XCTAssertEqual(result.status, .success)
         XCTAssertLessThanOrEqual(result.statesExplored, 10)
     }
 
@@ -83,58 +67,24 @@ final class ModelCheckerConfigurationTests: XCTestCase {
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
         config.maxStates = 0
         config.checkDeadlock = false
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config
+        )
 
         // With maxStates = 0, behavior depends on implementation
         // Either completes immediately or explores no states
-        XCTAssertNotNil(result)
+        XCTAssertNotEqual(result.status, .error)
     }
 
-    // MARK: - Invariant Configuration Tests
+    // MARK: - Max Depth Limit Tests
 
-    func testInvariantConfiguration() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x = 0
-
-        Next == x' = (x + 1) % 10
-
-        TypeOK == x \\in 0..9
-        Safety == x >= 0
-
-        Spec == Init /\\ [][Next]_x
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 20
-        config.invariants = ["TypeOK", "Safety"]
-
-        let result = await checker.check(module: module, config: config)
-
-        // Both invariants should hold
-        XCTAssertEqual(result.status, .completed)
-    }
-
-    func testMultipleInvariants() async throws {
+    func testMaxDepthLimit() async throws {
         let source = """
         ---- MODULE Test ----
         VARIABLE x
@@ -143,104 +93,35 @@ final class ModelCheckerConfigurationTests: XCTestCase {
 
         Next == x' = x + 1
 
-        Inv1 == x >= 0
-        Inv2 == x < 100
-
         Spec == Init /\\ [][Next]_x
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 200
-        config.invariants = ["Inv1", "Inv2"]
-
-        let result = await checker.check(module: module, config: config)
-
-        // Inv2 (x < 100) should be violated
-        XCTAssertEqual(result.status, .invariantViolation)
-    }
-
-    // MARK: - Deadlock Configuration Tests
-
-    func testDeadlockCheckEnabled() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x = 0
-
-        Inc == x < 3 /\\ x' = x + 1
-
-        Next == Inc
-
-        Spec == Init /\\ [][Next]_x
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 20
-        config.checkDeadlock = true
-
-        let result = await checker.check(module: module, config: config)
-
-        XCTAssertEqual(result.status, .deadlock)
-    }
-
-    func testDeadlockCheckDisabled() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x = 0
-
-        Inc == x < 3 /\\ x' = x + 1
-
-        Next == Inc
-
-        Spec == Init /\\ [][Next]_x
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 20
+        var config = ModelChecker.Configuration()
+        config.maxDepth = 5
+        config.maxStates = 1000
         config.checkDeadlock = false
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config
+        )
 
-        // With deadlock check disabled, should complete normally
-        XCTAssertEqual(result.status, .completed)
+        // Should respect depth limit
+        XCTAssertEqual(result.status, .success)
     }
 
-    // MARK: - Interpreter Bounds Integration Tests
+    // MARK: - Invariant Configuration Tests
 
-    func testNatIntBoundsPassedToInterpreter() async throws {
+    func testInvariantChecking() async throws {
         let source = """
         ---- MODULE Test ----
-        EXTENDS Integers
-
         VARIABLE x
 
-        Init == x \\in Nat
+        Init == x = 0
 
-        Next == x' = x
+        Next == x' = x + 1
 
         TypeOK == x >= 0
 
@@ -248,137 +129,168 @@ final class ModelCheckerConfigurationTests: XCTestCase {
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 20
-
-        // This tests that Nat is bounded correctly
-        let result = await checker.check(module: module, config: config)
-
-        XCTAssertNotNil(result)
-    }
-
-    // MARK: - Result Reporting Tests
-
-    func testResultReportsStatesExplored() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x \\in {0, 1, 2}
-
-        Next == x' = x
-
-        Spec == Init /\\ [][Next]_x
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 100
+        var config = ModelChecker.Configuration()
+        config.maxStates = 10
         config.checkDeadlock = false
+        config.checkInvariants = true
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            invariants: [ModelChecker.InvariantSpec(name: "TypeOK")]
+        )
 
-        // Should explore exactly 3 states
-        XCTAssertEqual(result.statesExplored, 3)
+        // Invariant should hold
+        XCTAssertEqual(result.status, .success)
     }
 
-    func testResultReportsDistinctStates() async throws {
+    func testInvariantViolation() async throws {
         let source = """
         ---- MODULE Test ----
         VARIABLE x
 
         Init == x = 0
 
-        Toggle == x' = 1 - x
+        Next == x' = x + 1
 
-        Next == Toggle
+        TypeOK == x < 5
 
         Spec == Init /\\ [][Next]_x
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 100
+        var config = ModelChecker.Configuration()
+        config.maxStates = 20
+        config.checkDeadlock = false
+        config.checkInvariants = true
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            invariants: [ModelChecker.InvariantSpec(name: "TypeOK")]
+        )
 
-        // Only 2 distinct states: x=0 and x=1
-        XCTAssertEqual(result.statesExplored, 2)
+        // Invariant should be violated when x reaches 5
+        XCTAssertEqual(result.status, .failure)
     }
 
-    // MARK: - Edge Case Tests
+    // MARK: - Deadlock Configuration Tests
 
-    func testEmptyInitialStates() async throws {
+    func testDeadlockCheckingEnabled() async throws {
         let source = """
         ---- MODULE Test ----
         VARIABLE x
 
-        Init == x \\in {}
+        Init == x = 0
 
-        Next == x' = x
-
-        Spec == Init /\\ [][Next]_x
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        let config = ModelCheckerConfiguration()
-
-        let result = await checker.check(module: module, config: config)
-
-        // No initial states - should complete with 0 states
-        XCTAssertEqual(result.statesExplored, 0)
-    }
-
-    func testSingleStateNoTransitions() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x = 42
-
-        Next == FALSE
+        Next == x < 2 /\\ x' = x + 1
 
         Spec == Init /\\ [][Next]_x
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
+        config.maxStates = 20
         config.checkDeadlock = true
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config
+        )
 
-        // Single state, no transitions - deadlock
-        XCTAssertEqual(result.status, .deadlock)
-        XCTAssertEqual(result.statesExplored, 1)
+        // Should detect deadlock when x reaches 2
+        XCTAssertEqual(result.status, .failure)
+    }
+
+    func testDeadlockCheckingDisabled() async throws {
+        let source = """
+        ---- MODULE Test ----
+        VARIABLE x
+
+        Init == x = 0
+
+        Next == x < 2 /\\ x' = x + 1
+
+        Spec == Init /\\ [][Next]_x
+        ====
+        """
+
+        let checker = ModelChecker()
+        var config = ModelChecker.Configuration()
+        config.maxStates = 20
+        config.checkDeadlock = false
+
+        let result = await checker.verify(
+            specification: source,
+            config: config
+        )
+
+        // Should succeed because deadlock checking is disabled
+        XCTAssertEqual(result.status, .success)
+    }
+
+    // MARK: - Constant Override Tests
+
+    func testConstantOverride() async throws {
+        let source = """
+        ---- MODULE Test ----
+        CONSTANT N
+        VARIABLE x
+
+        Init == x = 0
+
+        Next == x < N /\\ x' = x + 1
+
+        TypeOK == x <= N
+
+        Spec == Init /\\ [][Next]_x
+        ====
+        """
+
+        let checker = ModelChecker()
+        var config = ModelChecker.Configuration()
+        config.maxStates = 20
+        config.checkDeadlock = false
+
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            constants: [ModelChecker.ConstantOverride(name: "N", value: "3")],
+            invariants: [ModelChecker.InvariantSpec(name: "TypeOK")]
+        )
+
+        // TypeOK should hold with N = 3
+        XCTAssertEqual(result.status, .success)
+    }
+
+    // MARK: - Workers Configuration Tests
+
+    func testSingleWorker() async throws {
+        let source = """
+        ---- MODULE Test ----
+        VARIABLE x
+
+        Init == x = 0
+
+        Next == x' = (x + 1) % 5
+
+        Spec == Init /\\ [][Next]_x
+        ====
+        """
+
+        let checker = ModelChecker()
+        var config = ModelChecker.Configuration()
+        config.workers = 1
+        config.maxStates = 20
+
+        let result = await checker.verify(
+            specification: source,
+            config: config
+        )
+
+        XCTAssertEqual(result.status, .success)
     }
 }

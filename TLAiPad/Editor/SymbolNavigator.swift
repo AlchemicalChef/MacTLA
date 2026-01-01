@@ -404,8 +404,14 @@ final class SymbolNavigator {
             guard lineIndex >= 0 && lineIndex < lines.count else { continue }
 
             var line = lines[lineIndex]
-            let startIndex = line.index(line.startIndex, offsetBy: ref.column - 1, limitedBy: line.endIndex) ?? line.endIndex
-            let endIndex = line.index(startIndex, offsetBy: ref.length, limitedBy: line.endIndex) ?? line.endIndex
+
+            // Validate column and length are within bounds
+            let columnOffset = ref.column - 1
+            guard columnOffset >= 0 && columnOffset < line.count else { continue }
+            guard ref.length > 0 && columnOffset + ref.length <= line.count else { continue }
+
+            let startIndex = line.index(line.startIndex, offsetBy: columnOffset)
+            let endIndex = line.index(startIndex, offsetBy: ref.length)
 
             // Verify the text at this location matches
             let existingText = String(line[startIndex..<endIndex])

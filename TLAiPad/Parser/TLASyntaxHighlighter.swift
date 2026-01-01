@@ -389,6 +389,145 @@ extension TLASyntaxHighlighter {
         }
     }
 
+    /// Prepared highlight operation for applying on main thread
+    struct HighlightOperation: Sendable {
+        let range: NSRange
+        let colorKey: String
+    }
+
+    /// Prepare highlight operations on background thread (thread-safe, no UI calls)
+    /// Returns operations that can be quickly applied on main thread
+    func prepareHighlightOperations(
+        tokens: [TLAToken],
+        source: String
+    ) -> [HighlightOperation] {
+        guard !source.isEmpty else { return [] }
+
+        let lineOffsets = precomputeLineOffsets(in: source)
+        var operations: [HighlightOperation] = []
+        operations.reserveCapacity(tokens.count / 2)  // Rough estimate after filtering
+
+        for token in tokens {
+            guard token.length > 0 else { continue }
+
+            // Skip tokens that use default text color
+            if shouldSkipToken(token.type) { continue }
+
+            let offset = characterOffset(for: token, using: lineOffsets)
+            guard offset < source.count else { continue }
+
+            let length = min(token.length, source.count - offset)
+            let range = NSRange(location: offset, length: length)
+            let key = colorKey(for: token.type)
+
+            operations.append(HighlightOperation(range: range, colorKey: key))
+        }
+
+        return operations
+    }
+
+    /// Apply pre-computed highlight operations on main thread (fast, minimal work)
+    func applyHighlightOperations(
+        _ operations: [HighlightOperation],
+        to layoutManager: NSLayoutManager,
+        theme: HighlightTheme = .default
+    ) {
+        let colorCache = buildColorCache(theme: theme)
+
+        for op in operations {
+            let color = colorCache[op.colorKey] ?? NSColor.textColor
+            layoutManager.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: op.range)
+        }
+    }
+
+    /// Apply highlighting using temporary attributes (no layout recalculation - FAST)
+    /// This is the recommended approach for large files per Apple documentation.
+    /// Temporary attributes are display-only and don't trigger re-layout.
+    func applyHighlightingWithTemporaryAttributes(
+        _ tokens: [TLAToken],
+        to layoutManager: NSLayoutManager,
+        source: String,
+        theme: HighlightTheme = .default
+    ) {
+        guard !source.isEmpty else { return }
+
+        let lineOffsets = precomputeLineOffsets(in: source)
+
+        // Pre-cache NSColor objects for better performance
+        let colorCache = buildColorCache(theme: theme)
+
+        for token in tokens {
+            guard token.length > 0 else { continue }
+
+            // Skip tokens that use default text color (identifiers, etc.)
+            // This significantly reduces the number of attribute operations
+            if shouldSkipToken(token.type) { continue }
+
+            let offset = characterOffset(for: token, using: lineOffsets)
+            guard offset < source.count else { continue }
+
+            let length = min(token.length, source.count - offset)
+            let range = NSRange(location: offset, length: length)
+
+            // Use cached color lookup
+            let color = colorCache[colorKey(for: token.type)] ?? NSColor.textColor
+            layoutManager.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: range)
+        }
+    }
+
+    /// Check if token uses default text color and can be skipped
+    private func shouldSkipToken(_ tokenType: TLATokenType) -> Bool {
+        switch tokenType {
+        case .identifier:
+            return true  // Identifiers use default text color
+        case .eof:
+            return true  // EOF has no visual representation
+        case .leftParen, .rightParen, .leftBracket, .rightBracket,
+             .leftBrace, .rightBrace, .comma, .colon, .doubleColon,
+             .semicolon, .dot, .exclamation, .pipe, .subscriptSeparator:
+            return true  // Delimiters use default text color
+        default:
+            return false
+        }
+    }
+
+    /// Generate a key for color cache lookup
+    private func colorKey(for tokenType: TLATokenType) -> String {
+        switch tokenType {
+        case .keyword(let kw):
+            switch kw {
+            case .module, .extends:
+                return "module"
+            case .constant, .constants, .variable, .variables:
+                return "constant"
+            default:
+                return "keyword"
+            }
+        case .operator: return "operator"
+        case .number: return "number"
+        case .string: return "string"
+        case .comment, .blockComment: return "comment"
+        case .moduleStart, .moduleEnd: return "module"
+        case .unknown: return "error"
+        default: return "default"
+        }
+    }
+
+    /// Build a cache of NSColor objects for each token category
+    private func buildColorCache(theme: HighlightTheme) -> [String: NSColor] {
+        return [
+            "keyword": nsColor(from: theme.keyword),
+            "constant": nsColor(from: theme.constant),
+            "operator": nsColor(from: theme.operator),
+            "number": nsColor(from: theme.number),
+            "string": nsColor(from: theme.string),
+            "comment": nsColor(from: theme.comment),
+            "module": nsColor(from: theme.module),
+            "error": nsColor(from: theme.error),
+            "default": NSColor.textColor
+        ]
+    }
+
     /// Convert SwiftUI Color to NSColor
     private func nsColor(from color: Color) -> NSColor {
         // Handle standard colors

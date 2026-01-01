@@ -123,8 +123,15 @@ struct EditorDetailView: View {
     }
 
     private func updateDiagnostics(for content: String) {
-        // Cancel any pending diagnostics work
+        // Cancel and clear any pending diagnostics work to avoid memory leaks
         diagnosticsWorkItem?.cancel()
+        diagnosticsWorkItem = nil
+
+        // Skip diagnostics for very large files to prevent UI hang
+        guard content.count < 50_000 else {
+            diagnostics = []
+            return
+        }
 
         let workItem = DispatchWorkItem { [content] in
             // Run analysis on background thread
@@ -143,6 +150,11 @@ struct EditorDetailView: View {
 
     /// Immediately run diagnostics without debouncing (for onAppear)
     private func updateDiagnosticsImmediately(for content: String) {
+        // Skip diagnostics for very large files to prevent UI hang
+        guard content.count < 50_000 else {
+            diagnostics = []
+            return
+        }
         Task.detached(priority: .utility) {
             let results = TLADiagnostics.shared.analyze(content)
             await MainActor.run {

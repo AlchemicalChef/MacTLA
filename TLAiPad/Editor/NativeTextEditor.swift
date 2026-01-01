@@ -17,13 +17,14 @@ struct NativeTextEditor: View {
     var body: some View {
         GeometryReader { geometry in
             HStack(spacing: 0) {
-                // Line number gutter with cached count and viewport awareness
+                // Line number gutter (NSView-based for reliability)
                 LineNumberGutter(
                     scrollOffset: scrollOffset,
                     font: font,
                     cachedLineCount: cachedLineCount,
                     visibleHeight: geometry.size.height
                 )
+                .frame(width: 44)
 
                 // Editor
                 EditorTextView(
@@ -50,64 +51,76 @@ struct NativeTextEditor: View {
     }
 }
 
-// MARK: - Line Number Gutter
+// MARK: - Line Number Gutter (NSView-based for reliability)
 
-/// SwiftUI view showing line numbers that syncs with editor scroll
-/// Uses viewport-aware rendering for performance with large files
-struct LineNumberGutter: View {
+/// NSView-based line number gutter that syncs with editor scroll
+struct LineNumberGutter: NSViewRepresentable {
     let scrollOffset: CGFloat
     let font: NSFont
     let cachedLineCount: Int
     let visibleHeight: CGFloat
 
+    func makeNSView(context: Context) -> LineNumberGutterView {
+        let view = LineNumberGutterView()
+        view.font = font
+        view.lineCount = cachedLineCount
+        return view
+    }
+
+    func updateNSView(_ nsView: LineNumberGutterView, context: Context) {
+        nsView.font = font
+        nsView.lineCount = cachedLineCount
+        nsView.scrollOffset = scrollOffset
+        nsView.needsDisplay = true
+    }
+}
+
+/// Custom NSView that draws line numbers efficiently
+class LineNumberGutterView: NSView {
+    var font: NSFont = .monospacedSystemFont(ofSize: 13, weight: .regular)
+    var lineCount: Int = 1
+    var scrollOffset: CGFloat = 0
+
     private var lineHeight: CGFloat {
-        // Approximate line height based on font
-        font.pointSize * 1.3
+        // Match NSTextView's default line height calculation
+        let layoutManager = NSLayoutManager()
+        return layoutManager.defaultLineHeight(for: font)
     }
 
-    /// Calculate the range of visible lines with a buffer
-    private var visibleRange: Range<Int> {
+    override var isFlipped: Bool { true }  // Top-to-bottom coordinate system
+
+    override func draw(_ dirtyRect: NSRect) {
+        // Draw background
+        NSColor.controlBackgroundColor.setFill()
+        dirtyRect.fill()
+
+        // Calculate visible line range
         let topPadding: CGFloat = 8  // Match textContainerInset
-        let adjustedOffset = max(0, scrollOffset - topPadding)
-        let firstVisible = max(0, Int(adjustedOffset / lineHeight) - 5)  // 5 line buffer above
-        let visibleLines = Int(visibleHeight / lineHeight) + 15  // Extra buffer below
-        let lastVisible = min(cachedLineCount, firstVisible + visibleLines)
-        return firstVisible..<max(firstVisible + 1, lastVisible)
+        let lh = lineHeight
+        let firstVisibleLine = max(0, Int((scrollOffset - topPadding) / lh))
+        let visibleLines = Int(bounds.height / lh) + 2
+        let lastVisibleLine = min(lineCount, firstVisibleLine + visibleLines)
+
+        // Text attributes
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .right
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: font.pointSize - 2, weight: .regular),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: paragraphStyle
+        ]
+
+        // Draw only visible line numbers
+        for lineNum in firstVisibleLine..<lastVisibleLine {
+            let y = topPadding + CGFloat(lineNum) * lh - scrollOffset
+            let text = "\(lineNum + 1)"
+            let rect = NSRect(x: 0, y: y, width: bounds.width - 6, height: lh)
+            text.draw(in: rect, withAttributes: attributes)
+        }
     }
 
-    var body: some View {
-        GeometryReader { geometry in
-            ScrollView(.vertical, showsIndicators: false) {
-                VStack(alignment: .trailing, spacing: 0) {
-                    // Spacer for lines before visible range
-                    if visibleRange.lowerBound > 0 {
-                        Color.clear
-                            .frame(height: CGFloat(visibleRange.lowerBound) * lineHeight)
-                    }
-
-                    // Only render visible lines
-                    ForEach(visibleRange, id: \.self) { index in
-                        Text("\(index + 1)")
-                            .font(.system(size: font.pointSize - 2, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .frame(height: lineHeight)
-                    }
-
-                    // Spacer for lines after visible range
-                    if visibleRange.upperBound < cachedLineCount {
-                        Color.clear
-                            .frame(height: CGFloat(cachedLineCount - visibleRange.upperBound) * lineHeight)
-                    }
-                }
-                .padding(.top, 8)
-                .padding(.trailing, 6)
-            }
-            .scrollDisabled(true)
-            .offset(y: -scrollOffset)
-        }
-        .frame(width: 44)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipped()
+    override var intrinsicContentSize: NSSize {
+        return NSSize(width: 44, height: NSView.noIntrinsicMetric)
     }
 }
 
@@ -228,6 +241,10 @@ struct EditorTextView: NSViewRepresentable {
         var currentBracketHighlightRange: NSRange?
         var matchingBracketHighlightRange: NSRange?
 
+        // Scroll throttling - only update when scroll changes by more than lineHeight
+        private var lastReportedScrollOffset: CGFloat = 0
+        private var scrollThreshold: CGFloat = 10 // pixels before updating
+
         // Bracket pairs to match
         static let bracketPairs: [(open: String, close: String)] = [
             ("(", ")"),
@@ -251,7 +268,13 @@ struct EditorTextView: NSViewRepresentable {
             guard let textView = textView,
                   let scrollView = textView.enclosingScrollView else { return }
             let offset = scrollView.contentView.bounds.origin.y
-            onScrollChange?(offset)
+
+            // Throttle updates: only notify when scroll changes significantly
+            let delta = abs(offset - lastReportedScrollOffset)
+            if delta >= scrollThreshold {
+                lastReportedScrollOffset = offset
+                onScrollChange?(offset)
+            }
         }
 
         func textDidChange(_ notification: Notification) {
@@ -273,35 +296,52 @@ struct EditorTextView: NSViewRepresentable {
         private var highlightWorkItem: DispatchWorkItem?
         private var highlightTask: Task<Void, Never>?
 
+        /// Main highlighting entry point - uses temporary attributes for performance
+        /// All heavy computation (tokenization, range calculation) happens on background thread
         private func applyHighlightingDebounced(to textView: NSTextView) {
             highlightWorkItem?.cancel()
             highlightTask?.cancel()
 
-            let workItem = DispatchWorkItem { [weak self] in
-                guard let self = self else { return }
+            let workItem = DispatchWorkItem { [weak self, weak textView] in
+                guard let self = self, let textView = textView else { return }
 
-                // Capture text for background processing
                 let text = textView.string
-                let font = self.parent.font
+                let textLength = (text as NSString).length
 
-                // Cancel any previous task
                 self.highlightTask?.cancel()
 
-                // Process tokenization on background thread
-                self.highlightTask = Task.detached(priority: .userInitiated) {
-                    // Check for cancellation
+                // All heavy work on background thread: tokenize + prepare operations
+                self.highlightTask = Task.detached(priority: .userInitiated) { [weak self, weak textView] in
                     guard !Task.isCancelled else { return }
 
-                    // Tokenize on background thread
+                    // Heavy work 1: Tokenization (PROFILED)
+                    let tokenizeStart = CFAbsoluteTimeGetCurrent()
                     let lexer = TLALexer(source: text)
                     let tokens = lexer.scanTokens()
+                    let tokenizeTime = CFAbsoluteTimeGetCurrent() - tokenizeStart
 
-                    // Check for cancellation before applying
                     guard !Task.isCancelled else { return }
 
-                    // Apply attributes on main thread
-                    await MainActor.run {
-                        self.applyTokenAttributes(tokens, text: text, to: textView, font: font)
+                    // Heavy work 2: Prepare highlight operations (PROFILED)
+                    let prepareStart = CFAbsoluteTimeGetCurrent()
+                    let operations = TLASyntaxHighlighter.shared.prepareHighlightOperations(
+                        tokens: tokens,
+                        source: text
+                    )
+                    let prepareTime = CFAbsoluteTimeGetCurrent() - prepareStart
+
+                    guard !Task.isCancelled, let textView = textView else { return }
+
+                    // Minimal main thread work: just apply pre-computed operations
+                    await MainActor.run { [weak self, weak textView] in
+                        guard let self = self, let textView = textView else { return }
+                        self.applyPreparedHighlighting(
+                            operations: operations,
+                            textLength: textLength,
+                            tokenizeTime: tokenizeTime,
+                            prepareTime: prepareTime,
+                            to: textView
+                        )
                     }
                 }
             }
@@ -311,75 +351,56 @@ struct EditorTextView: NSViewRepresentable {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: workItem)
         }
 
-        /// Apply token attributes - called on main thread after background tokenization
-        private func applyTokenAttributes(_ tokens: [TLAToken], text: String, to textView: NSTextView, font: NSFont) {
-            guard !isUpdating else { return }
+        /// Apply pre-computed highlighting operations (minimal main thread work)
+        private func applyPreparedHighlighting(
+            operations: [TLASyntaxHighlighter.HighlightOperation],
+            textLength: Int,
+            tokenizeTime: Double = 0,
+            prepareTime: Double = 0,
+            to textView: NSTextView
+        ) {
+            guard !isUpdating,
+                  let layoutManager = textView.layoutManager,
+                  textLength > 0 else { return }
+
             isUpdating = true
             defer { isUpdating = false }
 
-            guard let textStorage = textView.textStorage,
-                  textStorage.length > 0,
-                  textStorage.string == text else { return }  // Verify text hasn't changed
+            let applyStart = CFAbsoluteTimeGetCurrent()
 
-            let selectedRanges = textView.selectedRanges
-            let fullRange = NSRange(location: 0, length: textStorage.length)
+            let fullRange = NSRange(location: 0, length: textLength)
 
-            textStorage.beginEditing()
+            // Clear previous highlighting
+            layoutManager.removeTemporaryAttribute(.foregroundColor, forCharacterRange: fullRange)
 
-            // Reset to default attributes
-            textStorage.setAttributes([
-                .font: font,
-                .foregroundColor: NSColor.textColor
-            ], range: fullRange)
+            // Apply pre-computed operations (very fast - just dictionary lookups and attribute calls)
+            TLASyntaxHighlighter.shared.applyHighlightOperations(operations, to: layoutManager)
 
-            // Apply syntax highlighting using pre-tokenized tokens
-            TLASyntaxHighlighter.shared.applyHighlightingAttributesWithTokens(
-                tokens,
-                to: textStorage,
-                font: font
-            )
+            let applyTime = CFAbsoluteTimeGetCurrent() - applyStart
 
-            textStorage.endEditing()
-
-            // Restore selection
-            if let firstRange = selectedRanges.first as? NSRange,
-               firstRange.location + firstRange.length <= textStorage.length {
-                textView.setSelectedRange(firstRange)
+            // Write profiling results to file
+            let profileLine = String(format: "[%@] tokenize=%.2fms, prepare=%.2fms, apply=%.2fms, ops=%d, chars=%d\n",
+                                     ISO8601DateFormatter().string(from: Date()),
+                                     tokenizeTime * 1000, prepareTime * 1000, applyTime * 1000, operations.count, textLength)
+            let profilePath = "/Users/night/Documents/GitHub/MacTLA/Profiler.txt"
+            if let data = profileLine.data(using: .utf8) {
+                if FileManager.default.fileExists(atPath: profilePath) {
+                    if let handle = FileHandle(forWritingAtPath: profilePath) {
+                        handle.seekToEndOfFile()
+                        handle.write(data)
+                        handle.closeFile()
+                    }
+                } else {
+                    FileManager.default.createFile(atPath: profilePath, contents: data)
+                }
             }
 
             updateBracketMatching(in: textView)
         }
 
+        // Legacy method - now uses temporary attributes
         private func applyHighlightingAttributesOnly(to textView: NSTextView) {
-            guard !isUpdating else { return }
-            isUpdating = true
-            defer { isUpdating = false }
-
-            guard let textStorage = textView.textStorage, textStorage.length > 0 else { return }
-
-            let selectedRanges = textView.selectedRanges
-            let fullRange = NSRange(location: 0, length: textStorage.length)
-
-            textStorage.beginEditing()
-
-            // Reset to default attributes
-            textStorage.setAttributes([
-                .font: parent.font,
-                .foregroundColor: NSColor.textColor
-            ], range: fullRange)
-
-            // Apply syntax highlighting
-            TLASyntaxHighlighter.shared.applyHighlightingAttributes(to: textStorage, font: parent.font)
-
-            textStorage.endEditing()
-
-            // Restore selection
-            if let firstRange = selectedRanges.first as? NSRange,
-               firstRange.location + firstRange.length <= textStorage.length {
-                textView.setSelectedRange(firstRange)
-            }
-
-            updateBracketMatching(in: textView)
+            applyHighlightingDebounced(to: textView)
         }
 
         // Handle special keys like Enter for auto-indent
@@ -521,7 +542,6 @@ struct EditorTextView: NSViewRepresentable {
 
             // If newText is provided and differs from current text, update text first
             if let newText = newText, textView.string != newText {
-                // Use textStorage to avoid triggering textDidChange
                 if let textStorage = textView.textStorage {
                     textStorage.beginEditing()
                     textStorage.replaceCharacters(in: NSRange(location: 0, length: textStorage.length), with: newText)
@@ -529,23 +549,10 @@ struct EditorTextView: NSViewRepresentable {
                 }
             }
 
-            // Apply highlighting attributes WITHOUT replacing text content
-            // This prevents the race condition that causes text to vanish
-            if let textStorage = textView.textStorage, textStorage.length > 0 {
-                let fullRange = NSRange(location: 0, length: textStorage.length)
-                textStorage.beginEditing()
-
-                // Reset to default attributes first
-                textStorage.setAttributes([
-                    .font: parent.font,
-                    .foregroundColor: NSColor.textColor
-                ], range: fullRange)
-
-                // Apply syntax highlighting colors
-                TLASyntaxHighlighter.shared.applyHighlightingAttributes(to: textStorage, font: parent.font)
-
-                textStorage.endEditing()
-            }
+            // Trigger debounced highlighting with temporary attributes
+            isUpdating = false
+            applyHighlightingDebounced(to: textView)
+            isUpdating = true
 
             // Restore selection
             let text = textView.string
@@ -553,9 +560,6 @@ struct EditorTextView: NSViewRepresentable {
                firstRange.location + firstRange.length <= text.count {
                 textView.setSelectedRange(firstRange)
             }
-
-            // Update bracket matching
-            updateBracketMatching(in: textView)
         }
 
         func updateBracketMatching(in textView: NSTextView) {

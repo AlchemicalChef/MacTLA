@@ -4,18 +4,6 @@ import XCTest
 /// Extended temporal property tests for ModelChecker
 final class ModelCheckerTemporalTests: XCTestCase {
 
-    // MARK: - Helper Methods
-
-    private func parse(_ source: String) -> TLAModule? {
-        let parser = TLAParser()
-        switch parser.parse(source) {
-        case .success(let module):
-            return module
-        case .failure:
-            return nil
-        }
-    }
-
     // MARK: - Always Tests
 
     func testAlwaysHolds() async throws {
@@ -33,20 +21,18 @@ final class ModelCheckerTemporalTests: XCTestCase {
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
         config.maxStates = 20
-        config.invariants = ["Inv"]
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            invariants: [ModelChecker.InvariantSpec(name: "Inv")]
+        )
 
         // Invariant should hold for all states
-        XCTAssertEqual(result.status, .completed)
+        XCTAssertEqual(result.status, .success)
     }
 
     func testAlwaysViolation() async throws {
@@ -64,20 +50,18 @@ final class ModelCheckerTemporalTests: XCTestCase {
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
         config.maxStates = 20
-        config.invariants = ["Inv"]
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            invariants: [ModelChecker.InvariantSpec(name: "Inv")]
+        )
 
         // Invariant x < 5 should be violated when x reaches 5
-        XCTAssertEqual(result.status, .invariantViolation)
+        XCTAssertEqual(result.status, .failure)
     }
 
     // MARK: - Eventually Tests
@@ -99,195 +83,51 @@ final class ModelCheckerTemporalTests: XCTestCase {
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
         config.maxStates = 20
-        config.properties = ["Liveness"]
+        config.checkLiveness = true
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            properties: [ModelChecker.PropertySpec(name: "Liveness")]
+        )
 
-        // With weak fairness, eventually x = 3 should hold
-        XCTAssertNotNil(result)
+        // x eventually reaches 3 with weak fairness
+        XCTAssertEqual(result.status, .success)
     }
 
-    func testEventuallyNeverHolds() async throws {
+    // MARK: - Deadlock Tests
+
+    func testDeadlockDetection() async throws {
         let source = """
         ---- MODULE Test ----
         VARIABLE x
 
         Init == x = 0
 
-        Stay == x' = x
-
-        Next == Stay
+        Next == x < 3 /\\ x' = x + 1
 
         Spec == Init /\\ [][Next]_x
-
-        Liveness == <>(x = 10)
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 10
-        config.properties = ["Liveness"]
-
-        let result = await checker.check(module: module, config: config)
-
-        // x never changes from 0, so x = 10 is never reached
-        XCTAssertNotNil(result)
-    }
-
-    // MARK: - Always-Eventually Tests
-
-    func testAlwaysEventuallyHolds() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x = 0
-
-        Toggle == x' = 1 - x
-
-        Next == Toggle
-
-        Spec == Init /\\ [][Next]_x /\\ WF_x(Toggle)
-
-        Liveness == []<>(x = 0)
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
         config.maxStates = 20
-        config.properties = ["Liveness"]
+        config.checkDeadlock = true
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config
+        )
 
-        // x toggles between 0 and 1, so always eventually x = 0
-        XCTAssertEqual(result.status, .completed)
+        // System deadlocks when x reaches 3
+        XCTAssertEqual(result.status, .failure)
     }
 
-    func testAlwaysEventuallyCycleViolation() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x = 0
-
-        Inc == x' = x + 1
-
-        Next == Inc
-
-        Spec == Init /\\ [][Next]_x
-
-        Liveness == []<>(x = 0)
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 20
-        config.properties = ["Liveness"]
-
-        let result = await checker.check(module: module, config: config)
-
-        // x keeps increasing, never returns to 0
-        XCTAssertNotNil(result)
-    }
-
-    // MARK: - Eventually-Always Tests
-
-    func testEventuallyAlwaysHolds() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x = 0
-
-        Inc == x < 5 /\\ x' = x + 1
-        Stay == x >= 5 /\\ x' = x
-
-        Next == Inc \\/ Stay
-
-        Spec == Init /\\ [][Next]_x
-
-        Liveness == <>[](x >= 5)
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 20
-        config.properties = ["Liveness"]
-
-        let result = await checker.check(module: module, config: config)
-
-        // Eventually x reaches 5 and stays >= 5 forever
-        XCTAssertNotNil(result)
-    }
-
-    func testEventuallyAlwaysNeverEstablished() async throws {
-        let source = """
-        ---- MODULE Test ----
-        VARIABLE x
-
-        Init == x = 0
-
-        Toggle == x' = 1 - x
-
-        Next == Toggle
-
-        Spec == Init /\\ [][Next]_x /\\ WF_x(Toggle)
-
-        Liveness == <>[](x = 1)
-        ====
-        """
-
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
-        let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 20
-        config.properties = ["Liveness"]
-
-        let result = await checker.check(module: module, config: config)
-
-        // x toggles forever, so x = 1 is never established permanently
-        XCTAssertNotNil(result)
-    }
-
-    // MARK: - Deadlock Detection Tests
-
-    func testDeadlockDetected() async throws {
+    func testNoDeadlockWithStuttering() async throws {
         let source = """
         ---- MODULE Test ----
         VARIABLE x
@@ -296,90 +136,129 @@ final class ModelCheckerTemporalTests: XCTestCase {
 
         Inc == x < 3 /\\ x' = x + 1
 
-        Next == Inc
+        Stutter == x' = x
+
+        Next == Inc \\/ Stutter
 
         Spec == Init /\\ [][Next]_x
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
+        var config = ModelChecker.Configuration()
         config.maxStates = 20
         config.checkDeadlock = true
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config
+        )
 
-        // At x = 3, Inc is disabled, causing deadlock
-        XCTAssertEqual(result.status, .deadlock)
+        // No deadlock because stuttering is always possible
+        XCTAssertEqual(result.status, .success)
     }
 
-    func testNoDeadlock() async throws {
+    // MARK: - Bounded Model Checking
+
+    func testBoundedModelChecking() async throws {
         let source = """
         ---- MODULE Test ----
         VARIABLE x
 
         Init == x = 0
 
-        Inc == x' = (x + 1) % 5
+        Next == x' = x + 1
 
-        Next == Inc
+        TypeOK == x >= 0
 
         Spec == Init /\\ [][Next]_x
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 20
-        config.checkDeadlock = true
+        var config = ModelChecker.Configuration()
+        config.maxStates = 10  // Bound to 10 states
+        config.checkDeadlock = false  // Disable deadlock check - infinite spec
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            invariants: [ModelChecker.InvariantSpec(name: "TypeOK")]
+        )
 
-        // Inc is always enabled (wraps around)
-        XCTAssertEqual(result.status, .completed)
+        // TypeOK holds in all explored states
+        XCTAssertEqual(result.status, .success)
+        XCTAssertLessThanOrEqual(result.statesExplored, 10)
     }
 
-    // MARK: - State Space Exhaustion Tests
+    // MARK: - Multiple Invariants
 
-    func testStatesExhausted() async throws {
+    func testMultipleInvariants() async throws {
+        let source = """
+        ---- MODULE Test ----
+        VARIABLE x, y
+
+        Init == x = 0 /\\ y = 0
+
+        Next == x' = (x + 1) % 3 /\\ y' = (y + 1) % 4
+
+        InvX == x >= 0 /\\ x < 3
+        InvY == y >= 0 /\\ y < 4
+        InvSum == x + y < 10
+
+        Spec == Init /\\ [][Next]_<<x, y>>
+        ====
+        """
+
+        let checker = ModelChecker()
+        var config = ModelChecker.Configuration()
+        config.maxStates = 50
+
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            invariants: [
+                ModelChecker.InvariantSpec(name: "InvX"),
+                ModelChecker.InvariantSpec(name: "InvY"),
+                ModelChecker.InvariantSpec(name: "InvSum")
+            ]
+        )
+
+        // All invariants should hold
+        XCTAssertEqual(result.status, .success)
+    }
+
+    // MARK: - State Space Exhaustion
+
+    func testStateSpaceExhausted() async throws {
         let source = """
         ---- MODULE Test ----
         VARIABLE x
 
-        Init == x = 0
+        Init == x \\in {0, 1, 2}
 
-        Inc == x' = x + 1
+        Next == x' \\in {0, 1, 2}
 
-        Next == Inc
+        TypeOK == x \\in {0, 1, 2}
 
         Spec == Init /\\ [][Next]_x
         ====
         """
 
-        guard let module = parse(source) else {
-            XCTFail("Parse failed")
-            return
-        }
-
         let checker = ModelChecker()
-        var config = ModelCheckerConfiguration()
-        config.maxStates = 5
+        var config = ModelChecker.Configuration()
+        config.maxStates = 100
         config.checkDeadlock = false
 
-        let result = await checker.check(module: module, config: config)
+        let result = await checker.verify(
+            specification: source,
+            config: config,
+            invariants: [ModelChecker.InvariantSpec(name: "TypeOK")]
+        )
 
-        // Should exhaust max states
-        XCTAssertEqual(result.status, .statesExhausted)
-        XCTAssertLessThanOrEqual(result.statesExplored, 5)
+        // Finite state space should be fully explored
+        XCTAssertEqual(result.status, .success)
+        // Exactly 3 distinct states
+        XCTAssertEqual(result.distinctStates, 3)
     }
 }

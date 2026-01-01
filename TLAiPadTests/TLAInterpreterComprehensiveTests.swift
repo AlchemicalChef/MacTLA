@@ -583,9 +583,10 @@ final class TLAInterpreterComprehensiveTests: XCTestCase {
         var env = makeEnv()
         try interpreter.loadModule(module, into: &env)
 
-        let result = try interpreter.evaluate(.identifier("Test", .unknown), in: env)
-        // When m < 1, treat as m = 1
-        XCTAssertEqual(result, .sequence([.integer(1), .integer(2)]))
+        // Per TLA+ semantics, SubSeq with m < 1 is undefined - we throw an error
+        XCTAssertThrowsError(try interpreter.evaluate(.identifier("Test", .unknown), in: env)) { error in
+            XCTAssertTrue("\(error)".contains("SubSeq"))
+        }
     }
 
     func testSubSeqNGreaterThanLength() throws {

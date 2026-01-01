@@ -11,7 +11,7 @@ final class TLAParserLexerSyntaxTests: XCTestCase {
     }
 
     private func lex(_ source: String) -> [TLAToken] {
-        TLALexer().tokenize(source)
+        TLALexer(source: source).scanTokens()
     }
 
     // MARK: - Quantifier Backslash Syntax Tests
@@ -80,7 +80,7 @@ final class TLAParserLexerSyntaxTests: XCTestCase {
         let tokens = lex("\\A")
 
         let forallTokens = tokens.filter {
-            if case .forall = $0.type { return true }
+            if case .operator(.forall) = $0.type { return true }
             return false
         }
         XCTAssertEqual(forallTokens.count, 1)
@@ -90,7 +90,7 @@ final class TLAParserLexerSyntaxTests: XCTestCase {
         let tokens = lex("\\E")
 
         let existsTokens = tokens.filter {
-            if case .exists = $0.type { return true }
+            if case .operator(.exists) = $0.type { return true }
             return false
         }
         XCTAssertEqual(existsTokens.count, 1)
@@ -100,7 +100,7 @@ final class TLAParserLexerSyntaxTests: XCTestCase {
         let tokens = lex("\\in")
 
         let inTokens = tokens.filter {
-            if case .in_ = $0.type { return true }
+            if case .operator(.elementOf) = $0.type { return true }
             return false
         }
         XCTAssertEqual(inTokens.count, 1)
