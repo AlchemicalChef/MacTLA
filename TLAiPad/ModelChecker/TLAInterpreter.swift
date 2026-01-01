@@ -8,6 +8,30 @@ final class TLAInterpreter {
     /// Constant overrides from configuration
     private var constantOverrides: [String: TLAValue] = [:]
 
+    /// Upper bound for Nat (0..natUpperBound). Valid range: 0-100000
+    var natUpperBound: Int = 1000 {
+        didSet {
+            if natUpperBound < 0 { natUpperBound = 0 }
+            if natUpperBound > 100000 { natUpperBound = 100000 }
+        }
+    }
+
+    /// Bound for Int (-intBound..intBound). Valid range: 0-100000
+    var intBound: Int = 1000 {
+        didSet {
+            if intBound < 0 { intBound = 0 }
+            if intBound > 100000 { intBound = 100000 }
+        }
+    }
+
+    /// Maximum length for Seq(S) sequences. Valid range: 0-10
+    var seqMaxLength: Int = 3 {
+        didSet {
+            if seqMaxLength < 0 { seqMaxLength = 0 }
+            if seqMaxLength > 10 { seqMaxLength = 10 }
+        }
+    }
+
     /// Sets a constant value from configuration
     /// - Parameters:
     ///   - name: The constant name
@@ -85,6 +109,12 @@ final class TLAInterpreter {
         }
 
         return nil
+    }
+
+    /// Represents a successor state with the action that produced it
+    struct SuccessorWithAction {
+        let state: TLAState
+        let actionName: String?
     }
 
     /// Evaluation environment for TLA+ expressions
@@ -235,12 +265,21 @@ final class TLAInterpreter {
     }
 
     func evaluateNext(_ nextDef: OperatorDefinition, state: TLAState, module: TLAModule) throws -> [TLAState] {
+        // Delegate to the version that tracks actions, discarding action info
+        return try evaluateNextWithActions(nextDef, state: state, module: module).map { $0.state }
+    }
+
+    /// Evaluates Next and returns successor states with their action names (for fairness checking)
+    func evaluateNextWithActions(_ nextDef: OperatorDefinition, state: TLAState, module: TLAModule) throws -> [SuccessorWithAction] {
         self.module = module
         var env = buildEnvironment(from: module)
         env.variables = state.variables
 
-        // Find all possible next states
-        var nextStates: [TLAState] = []
+        // Find all possible next states with their action names
+        var successors: [SuccessorWithAction] = []
+
+        // Extract action names from Next (look for disjuncts that are operator references)
+        let actionNames = extractActionNames(from: nextDef.body, module: module)
 
         // Extract primed variable assignments from Next
         let variables = Array(state.variables.keys)
@@ -249,8 +288,10 @@ final class TLAInterpreter {
         for assignment in possibleAssignments {
             // Create environment with both current and primed variables
             var nextEnv = env
+            nextEnv.primedVariables = [:]
             for (name, value) in assignment {
                 nextEnv.variables[name + "'"] = value
+                nextEnv.primedVariables[name] = value
             }
 
             // Check if Next predicate is satisfied
@@ -262,11 +303,74 @@ final class TLAInterpreter {
                 for (name, value) in assignment {
                     nextState.variables[name] = value
                 }
-                nextStates.append(nextState)
+
+                // Find which action(s) are satisfied for this transition
+                let satisfiedAction = findSatisfiedAction(actionNames, env: nextEnv, module: module)
+
+                successors.append(SuccessorWithAction(state: nextState, actionName: satisfiedAction))
             }
         }
 
-        return nextStates
+        return successors
+    }
+
+    /// Extracts action names from a Next formula (typically a disjunction of actions)
+    private func extractActionNames(from expr: TLAExpression, module: TLAModule) -> [String] {
+        var names: [String] = []
+
+        switch expr {
+        case .binary(let left, .or, let right, _):
+            // Next == Action1 \/ Action2 \/ ...
+            names.append(contentsOf: extractActionNames(from: left, module: module))
+            names.append(contentsOf: extractActionNames(from: right, module: module))
+
+        case .identifier(let name, _):
+            // Reference to an action operator
+            if module.declarations.contains(where: {
+                if case .operatorDef(let def) = $0 {
+                    return def.name == name && def.parameters.isEmpty
+                }
+                return false
+            }) {
+                names.append(name)
+            }
+
+        case .stuttering(let formula, _, _):
+            // [Next]_vars - extract from inner formula
+            names.append(contentsOf: extractActionNames(from: formula, module: module))
+
+        case .action(let formula, _, _):
+            // <<Next>>_vars - extract from inner formula
+            names.append(contentsOf: extractActionNames(from: formula, module: module))
+
+        default:
+            break
+        }
+
+        return names
+    }
+
+    /// Finds which action is satisfied in the given environment
+    private func findSatisfiedAction(_ actionNames: [String], env: Environment, module: TLAModule) -> String? {
+        for name in actionNames {
+            if let def = env.operators[name] ?? findOperator(name, in: module) {
+                if let result = try? evaluate(def.body, in: env),
+                   case .boolean(true) = result {
+                    return name
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Finds an operator definition in the module
+    private func findOperator(_ name: String, in module: TLAModule) -> OperatorDefinition? {
+        for decl in module.declarations {
+            if case .operatorDef(let def) = decl, def.name == name {
+                return def
+            }
+        }
+        return nil
     }
 
     func evaluateInvariant(_ invariant: OperatorDefinition, state: TLAState, module: TLAModule) throws -> Bool {
@@ -392,6 +496,19 @@ final class TLAInterpreter {
             return .set(Set((l...h).map { TLAValue.integer($0) }))
 
         case .functionApplication(let func_, let args, _):
+            // Check if this is a lambda application: (LAMBDA x : body)[arg]
+            if case .lambda(let params, let body, _) = func_ {
+                let argVals = try args.map { try evaluate($0, in: env) }
+                guard argVals.count == params.count else {
+                    throw InterpreterError.evaluationError("LAMBDA expects \(params.count) arguments, got \(argVals.count)")
+                }
+                var lambdaEnv = try env.incrementingRecursion()
+                for (param, val) in zip(params, argVals) {
+                    lambdaEnv.variables[param] = val
+                }
+                return try evaluate(body, in: lambdaEnv)
+            }
+
             // Check if this is a built-in function from standard modules
             if case .identifier(let funcName, _) = func_ {
                 if let builtinResult = try evaluateBuiltinFunction(funcName, args: args, in: env) {
@@ -469,7 +586,8 @@ final class TLAInterpreter {
             switch expr {
             case .identifier(let name, _):
                 let currentValue = try evaluate(expr, in: env)
-                guard let primedValue = env.variables[name + "'"] else {
+                // Look in primedVariables for next-state values, not variables with "'" suffix
+                guard let primedValue = env.primedVariables[name] else {
                     throw InterpreterError.evaluationError("UNCHANGED: primed variable '\(name)'' not defined in current context")
                 }
                 return .boolean(currentValue == primedValue)
@@ -479,7 +597,8 @@ final class TLAInterpreter {
                 for element in elements {
                     if case .identifier(let name, _) = element {
                         let currentValue = try evaluate(element, in: env)
-                        guard let primedValue = env.variables[name + "'"] else {
+                        // Look in primedVariables for next-state values
+                        guard let primedValue = env.primedVariables[name] else {
                             throw InterpreterError.evaluationError("UNCHANGED: primed variable '\(name)'' not defined in current context")
                         }
                         if currentValue != primedValue {
@@ -561,15 +680,18 @@ final class TLAInterpreter {
                 throw InterpreterError.typeMismatch(expected: "Set", got: "\(domainVal)")
             }
 
+            // Sort domain for deterministic CHOOSE behavior
+            // TLA+ CHOOSE must return the same value for the same input
+            let sortedDomain = domainSet.sorted { $0.sortKey < $1.sortKey }
+
             // Empty domain is an error - CHOOSE requires at least one element
-            guard let firstElement = domainSet.first else {
+            guard let firstElement = sortedDomain.first else {
                 throw InterpreterError.evaluationError("CHOOSE: domain is empty")
             }
 
-            // Return first element that satisfies the predicate
-            for val in domainSet {
-                var localEnv = env
-                localEnv.variables[boundVar.name] = val
+            // Return first element (in sorted order) that satisfies the predicate
+            for val in sortedDomain {
+                let localEnv = try bindPattern(boundVar, value: val, in: env)
                 let predVal = try evaluate(body, in: localEnv)
                 if case .boolean(true) = predVal {
                     return val
@@ -577,26 +699,51 @@ final class TLAInterpreter {
             }
 
             // Per TLA+ semantics: if no value satisfies P(x), return an unspecified
-            // but deterministic value. We use the first element of the domain.
+            // but deterministic value. We use the first element of the sorted domain.
             return firstElement
 
         case .functionConstruction(let boundVars, let body, _):
-            // [x \in S |-> expr] - create a function
-            guard let firstVar = boundVars.first,
-                  let domain = firstVar.domain else {
-                throw InterpreterError.evaluationError("Function construction requires a domain")
-            }
-            let domainVal = try evaluate(domain, in: env)
-            guard case .set(let domainSet) = domainVal else {
-                throw InterpreterError.typeMismatch(expected: "Set", got: "\(domainVal)")
+            // [x \in S |-> expr] or [x \in S, y \in T |-> expr] - create a function
+            guard !boundVars.isEmpty else {
+                throw InterpreterError.evaluationError("Function construction requires at least one bound variable")
             }
 
+            // Evaluate all domains
+            var domains: [[TLAValue]] = []
+            for bv in boundVars {
+                guard let domainExpr = bv.domain else {
+                    throw InterpreterError.evaluationError("Function construction requires a domain for each variable")
+                }
+                let domainVal = try evaluate(domainExpr, in: env)
+                guard case .set(let domainSet) = domainVal else {
+                    throw InterpreterError.typeMismatch(expected: "Set", got: "\(domainVal)")
+                }
+                domains.append(Array(domainSet))
+            }
+
+            // Single variable case - simple function
+            if boundVars.count == 1 {
+                var function: [TLAValue: TLAValue] = [:]
+                for val in domains[0] {
+                    let localEnv = try bindPattern(boundVars[0], value: val, in: env)
+                    let resultVal = try evaluate(body, in: localEnv)
+                    function[val] = resultVal
+                }
+                return .function(function)
+            }
+
+            // Multiple variables - function from tuples
+            // Compute Cartesian product of domains
             var function: [TLAValue: TLAValue] = [:]
-            for val in domainSet {
+            let tuples = cartesianProduct(domains)
+            for tuple in tuples {
                 var localEnv = env
-                localEnv.variables[firstVar.name] = val
+                for (bv, val) in zip(boundVars, tuple) {
+                    localEnv = try bindPattern(bv, value: val, in: localEnv)
+                }
+                let key = TLAValue.sequence(tuple)  // Use tuple as key
                 let resultVal = try evaluate(body, in: localEnv)
-                function[val] = resultVal
+                function[key] = resultVal
             }
             return .function(function)
 
@@ -1061,6 +1208,29 @@ final class TLAInterpreter {
         }
     }
 
+    /// Binds a value to a bound variable pattern in the environment
+    /// For single patterns: binds the value to the name
+    /// For tuple patterns: destructures the value and binds each element to its name
+    private func bindPattern(_ boundVar: BoundVariable, value: TLAValue, in env: Environment) throws -> Environment {
+        switch boundVar.pattern {
+        case .single(let name):
+            return env.binding(name, to: value)
+        case .tuple(let names):
+            // Value must be a sequence/tuple for pattern matching
+            guard case .sequence(let elements) = value else {
+                throw InterpreterError.typeMismatch(expected: "Sequence/Tuple for pattern <<\(names.joined(separator: ", "))>>", got: "\(value)")
+            }
+            guard elements.count == names.count else {
+                throw InterpreterError.evaluationError("Tuple pattern has \(names.count) elements but value has \(elements.count)")
+            }
+            var newEnv = env
+            for (name, element) in zip(names, elements) {
+                newEnv = newEnv.binding(name, to: element)
+            }
+            return newEnv
+        }
+    }
+
     private func evaluateForall(_ vars: [BoundVariable], _ body: TLAExpression, _ env: Environment) throws -> TLAValue {
         guard let firstVar = vars.first else {
             return try evaluate(body, in: env)
@@ -1070,7 +1240,7 @@ final class TLAInterpreter {
         let remainingVars = Array(vars.dropFirst())
 
         for value in domain {
-            let newEnv = env.binding(firstVar.name, to: value)
+            let newEnv = try bindPattern(firstVar, value: value, in: env)
             let result: TLAValue
             if remainingVars.isEmpty {
                 result = try evaluate(body, in: newEnv)
@@ -1095,7 +1265,7 @@ final class TLAInterpreter {
         let remainingVars = Array(vars.dropFirst())
 
         for value in domain {
-            let newEnv = env.binding(firstVar.name, to: value)
+            let newEnv = try bindPattern(firstVar, value: value, in: env)
             let result: TLAValue
             if remainingVars.isEmpty {
                 result = try evaluate(body, in: newEnv)
@@ -1272,12 +1442,21 @@ final class TLAInterpreter {
                 throw InterpreterError.typeMismatch(expected: "Integer", got: "non-integer")
             }
             // TLA+ SubSeq(s, m, n) returns s[m..n] (1-indexed, inclusive)
-            // Empty if m > n or out of bounds
-            if m > n || m < 1 || n > seq.count {
+            // Per TLA+ semantics:
+            // - If m > n, returns <<>>
+            // - If m < 1, clamp to 1
+            // - If n > Len(s), clamp to Len(s)
+            // - If m > Len(s), returns <<>>
+            if m > n {
                 return .sequence([])
             }
-            // Convert to 0-indexed: [m-1, n-1] inclusive = [m-1, n) in Swift
-            return .sequence(Array(seq[(m-1)..<n]))
+            let clampedM = max(1, m)
+            let clampedN = min(n, seq.count)
+            if clampedM > seq.count {
+                return .sequence([])
+            }
+            // Convert to 0-indexed: [clampedM-1, clampedN-1] inclusive = [clampedM-1, clampedN) in Swift
+            return .sequence(Array(seq[(clampedM-1)..<clampedN]))
 
         case "SelectSeq":
             guard args.count == 2 else {
@@ -1288,22 +1467,66 @@ final class TLAInterpreter {
                 throw InterpreterError.typeMismatch(expected: "Sequence", got: "\(seqVal)")
             }
             // SelectSeq(s, Test) filters elements where Test(e) is TRUE
-            // The second arg must be an operator reference
-            guard case .identifier(let testName, _) = args[1],
-                  let testOp = env.operators[testName],
-                  testOp.parameters.count == 1 else {
-                throw InterpreterError.evaluationError("SelectSeq second argument must be a unary operator")
-            }
+            // Test can be either:
+            // 1. An operator name (identifier)
+            // 2. A LAMBDA expression
             var result: [TLAValue] = []
-            for elem in seq {
-                var testEnv = try env.incrementingRecursion()
-                testEnv.variables[testOp.parameterNames[0]] = elem
-                let testResult = try evaluate(testOp.body, in: testEnv)
-                if case .boolean(true) = testResult {
-                    result.append(elem)
+
+            if case .lambda(let params, let body, _) = args[1] {
+                // LAMBDA expression
+                guard params.count == 1 else {
+                    throw InterpreterError.evaluationError("SelectSeq lambda must take exactly 1 parameter")
                 }
+                for elem in seq {
+                    var testEnv = try env.incrementingRecursion()
+                    testEnv.variables[params[0]] = elem
+                    let testResult = try evaluate(body, in: testEnv)
+                    if case .boolean(true) = testResult {
+                        result.append(elem)
+                    }
+                }
+            } else if case .identifier(let testName, _) = args[1],
+                      let testOp = env.operators[testName],
+                      testOp.parameters.count == 1 {
+                // Operator reference
+                for elem in seq {
+                    var testEnv = try env.incrementingRecursion()
+                    testEnv.variables[testOp.parameterNames[0]] = elem
+                    let testResult = try evaluate(testOp.body, in: testEnv)
+                    if case .boolean(true) = testResult {
+                        result.append(elem)
+                    }
+                }
+            } else {
+                throw InterpreterError.evaluationError("SelectSeq second argument must be a unary operator or LAMBDA")
             }
             return .sequence(result)
+
+        case "Seq":
+            // Seq(S) - the set of all finite sequences with elements from S
+            // NOTE: This is infinite in TLA+, but we bound it for model checking
+            guard args.count == 1 else {
+                throw InterpreterError.evaluationError("Seq expects 1 argument, got \(args.count)")
+            }
+            let setVal = try evaluate(args[0], in: env)
+            guard case .set(let baseSet) = setVal else {
+                throw InterpreterError.typeMismatch(expected: "Set", got: "\(setVal)")
+            }
+
+            // Generate sequences up to a bounded length (default: 3)
+            // This is a common model checking approximation
+            let maxSeqLen = seqMaxLength
+            let elements = Array(baseSet)
+            var seqSet: Set<TLAValue> = [.sequence([])]  // Empty sequence
+
+            // Generate all sequences of length 1 to maxSeqLen
+            for length in 1...maxSeqLen {
+                let seqs = generateSequences(from: elements, length: length)
+                for seq in seqs {
+                    seqSet.insert(.sequence(seq))
+                }
+            }
+            return .set(seqSet)
 
         case "First":
             // First(s) == Head(s) - first element of sequence (alias)
@@ -1498,6 +1721,44 @@ final class TLAInterpreter {
         return Array(s).sorted { $0.sortKey < $1.sortKey }
     }
 
+    /// Computes the Cartesian product of multiple arrays
+    /// cartesianProduct([[1,2], [3,4]]) = [[1,3], [1,4], [2,3], [2,4]]
+    private func cartesianProduct(_ arrays: [[TLAValue]]) -> [[TLAValue]] {
+        guard !arrays.isEmpty else { return [[]] }
+        guard arrays.count > 1 else { return arrays[0].map { [$0] } }
+
+        var result: [[TLAValue]] = [[]]
+        for array in arrays {
+            var newResult: [[TLAValue]] = []
+            for existing in result {
+                for element in array {
+                    newResult.append(existing + [element])
+                }
+            }
+            result = newResult
+        }
+        return result
+    }
+
+    /// Generates all sequences of a given length from a set of elements
+    private func generateSequences(from elements: [TLAValue], length: Int) -> [[TLAValue]] {
+        guard length > 0 else { return [[]] }
+        guard !elements.isEmpty else { return [] }
+
+        if length == 1 {
+            return elements.map { [$0] }
+        }
+
+        var result: [[TLAValue]] = []
+        let shorterSeqs = generateSequences(from: elements, length: length - 1)
+        for seq in shorterSeqs {
+            for elem in elements {
+                result.append(seq + [elem])
+            }
+        }
+        return result
+    }
+
     // MARK: - Helpers
 
     private func buildEnvironment(from module: TLAModule) -> Environment {
@@ -1536,9 +1797,10 @@ final class TLAInterpreter {
     }
 
     private func addBuiltins(to env: inout Environment) {
-        // Naturals - limited to prevent memory exhaustion, but large enough for most specs
-        env.constants["Nat"] = .set(Set((0...1000).map { TLAValue.integer($0) }))
-        env.constants["Int"] = .set(Set((-1000...1000).map { TLAValue.integer($0) }))
+        // Naturals - limited to prevent memory exhaustion, configurable via natUpperBound
+        env.constants["Nat"] = .set(Set((0...natUpperBound).map { TLAValue.integer($0) }))
+        // Integers - configurable via intBound
+        env.constants["Int"] = .set(Set((-intBound...intBound).map { TLAValue.integer($0) }))
 
         // Booleans
         env.constants["BOOLEAN"] = .set([.boolean(true), .boolean(false)])

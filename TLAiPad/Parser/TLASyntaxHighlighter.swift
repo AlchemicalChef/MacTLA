@@ -51,13 +51,17 @@ final class TLASyntaxHighlighter {
     func highlight(_ source: String, theme: HighlightTheme = .default) -> AttributedString {
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
+        let lineOffsets = precomputeLineOffsets(in: source)
 
         var attributedString = AttributedString(source)
 
         for token in tokens {
             guard token.length > 0 else { continue }
 
-            let startIndex = source.index(source.startIndex, offsetBy: characterOffset(for: token, in: source))
+            let offset = characterOffset(for: token, using: lineOffsets)
+            guard offset < source.count else { continue }
+
+            let startIndex = source.index(source.startIndex, offsetBy: offset)
             guard startIndex < source.endIndex else { continue }
 
             let endIndex = source.index(startIndex, offsetBy: min(token.length, source.distance(from: startIndex, to: source.endIndex)))
@@ -78,6 +82,28 @@ final class TLASyntaxHighlighter {
 
     // MARK: - Private Methods
 
+    /// Precomputes line start offsets for efficient line/column to character offset conversion - O(n) single pass
+    private func precomputeLineOffsets(in source: String) -> [Int] {
+        var lineOffsets = [0]  // Line 1 starts at offset 0
+        var offset = 0
+        for char in source {
+            offset += 1
+            if char == "\n" {
+                lineOffsets.append(offset)
+            }
+        }
+        return lineOffsets
+    }
+
+    /// Converts line/column to character offset using precomputed line offsets - O(1)
+    private func characterOffset(for token: TLAToken, using lineOffsets: [Int]) -> Int {
+        guard token.line >= 1 && token.line <= lineOffsets.count else {
+            return 0
+        }
+        return lineOffsets[token.line - 1] + (token.column - 1)
+    }
+
+    /// Legacy method for backward compatibility - O(n) per call, avoid in loops
     private func characterOffset(for token: TLAToken, in source: String) -> Int {
         var offset = 0
         var currentLine = 1
@@ -154,6 +180,7 @@ extension TLASyntaxHighlighter {
     func attributedStringForUITextView(_ source: String, font: UIFont = .monospacedSystemFont(ofSize: 13, weight: .regular), theme: HighlightTheme = .default) -> NSAttributedString {
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
+        let lineOffsets = precomputeLineOffsets(in: source)
 
         // Create mutable attributed string with default attributes
         let attributedString = NSMutableAttributedString(string: source, attributes: [
@@ -164,7 +191,7 @@ extension TLASyntaxHighlighter {
         for token in tokens {
             guard token.length > 0 else { continue }
 
-            let offset = characterOffset(for: token, in: source)
+            let offset = characterOffset(for: token, using: lineOffsets)
             guard offset < source.count else { continue }
 
             let length = min(token.length, source.count - offset)
@@ -237,6 +264,7 @@ extension TLASyntaxHighlighter {
     func attributedStringForNSTextView(_ source: String, font: NSFont = .monospacedSystemFont(ofSize: 13, weight: .regular), theme: HighlightTheme = .default) -> NSAttributedString {
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
+        let lineOffsets = precomputeLineOffsets(in: source)
 
         // Create mutable attributed string with default attributes
         let attributedString = NSMutableAttributedString(string: source, attributes: [
@@ -247,7 +275,7 @@ extension TLASyntaxHighlighter {
         for token in tokens {
             guard token.length > 0 else { continue }
 
-            let offset = characterOffset(for: token, in: source)
+            let offset = characterOffset(for: token, using: lineOffsets)
             guard offset < source.count else { continue }
 
             let length = min(token.length, source.count - offset)
@@ -284,11 +312,12 @@ extension TLASyntaxHighlighter {
 
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
+        let lineOffsets = precomputeLineOffsets(in: source)
 
         for token in tokens {
             guard token.length > 0 else { continue }
 
-            let offset = characterOffset(for: token, in: source)
+            let offset = characterOffset(for: token, using: lineOffsets)
             guard offset < source.count else { continue }
 
             let length = min(token.length, source.count - offset)
@@ -311,6 +340,51 @@ extension TLASyntaxHighlighter {
                 }
             case .normal:
                 break
+            }
+        }
+    }
+
+    /// Applies syntax highlighting using pre-tokenized tokens (for background tokenization)
+    /// This version accepts tokens that were already computed on a background thread
+    func applyHighlightingAttributesWithTokens(_ tokens: [TLAToken], to textStorage: NSTextStorage, font: NSFont = .monospacedSystemFont(ofSize: 13, weight: .regular), theme: HighlightTheme = .default) {
+        let source = textStorage.string
+        guard !source.isEmpty else { return }
+
+        let lineOffsets = precomputeLineOffsets(in: source)
+
+        // Collect all attributes first for batching
+        var attributeOperations: [(NSRange, NSColor, NSFont?)] = []
+
+        for token in tokens {
+            guard token.length > 0 else { continue }
+
+            let offset = characterOffset(for: token, using: lineOffsets)
+            guard offset < source.count else { continue }
+
+            let length = min(token.length, source.count - offset)
+            let range = NSRange(location: offset, length: length)
+
+            let (swiftUIColor, style) = colorAndStyle(for: token.type, theme: theme)
+            let color = nsColor(from: swiftUIColor)
+
+            var styledFont: NSFont? = nil
+            switch style {
+            case .bold:
+                styledFont = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask)
+            case .italic:
+                styledFont = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
+            case .normal:
+                break
+            }
+
+            attributeOperations.append((range, color, styledFont))
+        }
+
+        // Apply all attributes in a single batch
+        for (range, color, styledFont) in attributeOperations {
+            textStorage.addAttribute(.foregroundColor, value: color, range: range)
+            if let font = styledFont {
+                textStorage.addAttribute(.font, value: font, range: range)
             }
         }
     }

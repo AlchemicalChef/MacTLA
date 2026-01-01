@@ -201,6 +201,16 @@ final class SymbolNavigator {
                     detail: "PROPERTY"
                 ))
             }
+
+        case .recursiveDecl(let decl):
+            // Forward declaration for recursive operator
+            let params = decl.parameterCount > 0 ? "(\(Array(repeating: "_", count: decl.parameterCount).joined(separator: ", ")))" : ""
+            symbols.append(Symbol(
+                name: decl.name,
+                kind: .operator,
+                location: decl.location,
+                detail: "RECURSIVE\(params)"
+            ))
         }
 
         return symbols

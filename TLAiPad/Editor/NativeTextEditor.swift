@@ -11,21 +11,41 @@ struct NativeTextEditor: View {
     var onTextChange: ((String) -> Void)?
 
     @State private var scrollOffset: CGFloat = 0
+    @State private var cachedLineCount: Int = 1
+    @State private var visibleHeight: CGFloat = 500
 
     var body: some View {
-        HStack(spacing: 0) {
-            // Line number gutter
-            LineNumberGutter(text: text, scrollOffset: scrollOffset, font: font)
+        GeometryReader { geometry in
+            HStack(spacing: 0) {
+                // Line number gutter with cached count and viewport awareness
+                LineNumberGutter(
+                    scrollOffset: scrollOffset,
+                    font: font,
+                    cachedLineCount: cachedLineCount,
+                    visibleHeight: geometry.size.height
+                )
 
-            // Editor
-            EditorTextView(
-                text: $text,
-                font: font,
-                onTextChange: onTextChange,
-                onScrollChange: { offset in
-                    scrollOffset = offset
-                }
-            )
+                // Editor
+                EditorTextView(
+                    text: $text,
+                    font: font,
+                    onTextChange: onTextChange,
+                    onScrollChange: { offset in
+                        scrollOffset = offset
+                    }
+                )
+            }
+            .onAppear {
+                visibleHeight = geometry.size.height
+                cachedLineCount = max(1, text.filter { $0 == "\n" }.count + 1)
+            }
+            .onChange(of: text) { _, newText in
+                // Only recount when text changes
+                cachedLineCount = max(1, newText.filter { $0 == "\n" }.count + 1)
+            }
+            .onChange(of: geometry.size.height) { _, newHeight in
+                visibleHeight = newHeight
+            }
         }
     }
 }
@@ -33,33 +53,56 @@ struct NativeTextEditor: View {
 // MARK: - Line Number Gutter
 
 /// SwiftUI view showing line numbers that syncs with editor scroll
+/// Uses viewport-aware rendering for performance with large files
 struct LineNumberGutter: View {
-    let text: String
     let scrollOffset: CGFloat
     let font: NSFont
-
-    private var lineCount: Int {
-        max(1, text.components(separatedBy: "\n").count)
-    }
+    let cachedLineCount: Int
+    let visibleHeight: CGFloat
 
     private var lineHeight: CGFloat {
         // Approximate line height based on font
         font.pointSize * 1.3
     }
 
+    /// Calculate the range of visible lines with a buffer
+    private var visibleRange: Range<Int> {
+        let topPadding: CGFloat = 8  // Match textContainerInset
+        let adjustedOffset = max(0, scrollOffset - topPadding)
+        let firstVisible = max(0, Int(adjustedOffset / lineHeight) - 5)  // 5 line buffer above
+        let visibleLines = Int(visibleHeight / lineHeight) + 15  // Extra buffer below
+        let lastVisible = min(cachedLineCount, firstVisible + visibleLines)
+        return firstVisible..<max(firstVisible + 1, lastVisible)
+    }
+
     var body: some View {
         GeometryReader { geometry in
-            VStack(alignment: .trailing, spacing: 0) {
-                ForEach(0..<lineCount, id: \.self) { index in
-                    let lineNumber = index + 1
-                    Text("\(lineNumber)")
-                        .font(.system(size: font.pointSize - 2, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .frame(height: lineHeight)
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .trailing, spacing: 0) {
+                    // Spacer for lines before visible range
+                    if visibleRange.lowerBound > 0 {
+                        Color.clear
+                            .frame(height: CGFloat(visibleRange.lowerBound) * lineHeight)
+                    }
+
+                    // Only render visible lines
+                    ForEach(visibleRange, id: \.self) { index in
+                        Text("\(index + 1)")
+                            .font(.system(size: font.pointSize - 2, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .frame(height: lineHeight)
+                    }
+
+                    // Spacer for lines after visible range
+                    if visibleRange.upperBound < cachedLineCount {
+                        Color.clear
+                            .frame(height: CGFloat(cachedLineCount - visibleRange.upperBound) * lineHeight)
+                    }
                 }
+                .padding(.top, 8)
+                .padding(.trailing, 6)
             }
-            .padding(.top, 8)
-            .padding(.trailing, 6)
+            .scrollDisabled(true)
             .offset(y: -scrollOffset)
         }
         .frame(width: 44)
@@ -228,18 +271,83 @@ struct EditorTextView: NSViewRepresentable {
         }
 
         private var highlightWorkItem: DispatchWorkItem?
+        private var highlightTask: Task<Void, Never>?
 
         private func applyHighlightingDebounced(to textView: NSTextView) {
             highlightWorkItem?.cancel()
+            highlightTask?.cancel()
 
             let workItem = DispatchWorkItem { [weak self] in
                 guard let self = self else { return }
-                self.applyHighlightingAttributesOnly(to: textView)
+
+                // Capture text for background processing
+                let text = textView.string
+                let font = self.parent.font
+
+                // Cancel any previous task
+                self.highlightTask?.cancel()
+
+                // Process tokenization on background thread
+                self.highlightTask = Task.detached(priority: .userInitiated) {
+                    // Check for cancellation
+                    guard !Task.isCancelled else { return }
+
+                    // Tokenize on background thread
+                    let lexer = TLALexer(source: text)
+                    let tokens = lexer.scanTokens()
+
+                    // Check for cancellation before applying
+                    guard !Task.isCancelled else { return }
+
+                    // Apply attributes on main thread
+                    await MainActor.run {
+                        self.applyTokenAttributes(tokens, text: text, to: textView, font: font)
+                    }
+                }
             }
             highlightWorkItem = workItem
 
-            // Small delay to batch rapid typing
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+            // 100ms delay to batch rapid typing
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: workItem)
+        }
+
+        /// Apply token attributes - called on main thread after background tokenization
+        private func applyTokenAttributes(_ tokens: [TLAToken], text: String, to textView: NSTextView, font: NSFont) {
+            guard !isUpdating else { return }
+            isUpdating = true
+            defer { isUpdating = false }
+
+            guard let textStorage = textView.textStorage,
+                  textStorage.length > 0,
+                  textStorage.string == text else { return }  // Verify text hasn't changed
+
+            let selectedRanges = textView.selectedRanges
+            let fullRange = NSRange(location: 0, length: textStorage.length)
+
+            textStorage.beginEditing()
+
+            // Reset to default attributes
+            textStorage.setAttributes([
+                .font: font,
+                .foregroundColor: NSColor.textColor
+            ], range: fullRange)
+
+            // Apply syntax highlighting using pre-tokenized tokens
+            TLASyntaxHighlighter.shared.applyHighlightingAttributesWithTokens(
+                tokens,
+                to: textStorage,
+                font: font
+            )
+
+            textStorage.endEditing()
+
+            // Restore selection
+            if let firstRange = selectedRanges.first as? NSRange,
+               firstRange.location + firstRange.length <= textStorage.length {
+                textView.setSelectedRange(firstRange)
+            }
+
+            updateBracketMatching(in: textView)
         }
 
         private func applyHighlightingAttributesOnly(to textView: NSTextView) {
@@ -480,43 +588,145 @@ struct EditorTextView: NSViewRepresentable {
             }
         }
 
+        /// Maximum search radius for bracket matching (characters in each direction)
+        private static let bracketSearchRadius = 5000
+
         func findMatchingBracket(in text: String, at position: Int) -> (NSRange, NSRange)? {
-            let chars = Array(text)
-            guard position >= 0 && position <= chars.count else { return nil }
+            // Use NSString for O(1) character access
+            let nsText = text as NSString
+            let length = nsText.length
+            guard position >= 0 && position <= length else { return nil }
 
             // Check position before cursor and at cursor
             let positionsToCheck = position > 0 ? [position - 1, position] : [position]
 
             for checkPos in positionsToCheck {
-                guard checkPos < chars.count else { continue }
+                guard checkPos < length else { continue }
+
+                let char = nsText.character(at: checkPos)
 
                 // Check for multi-char brackets first (<<, >>)
-                if checkPos + 1 < chars.count {
-                    let twoChar = String(chars[checkPos...checkPos + 1])
-                    if twoChar == "<<" {
-                        if let matchPos = findClosingBracket(chars: chars, from: checkPos, open: "<<", close: ">>") {
+                if checkPos + 1 < length {
+                    let nextChar = nsText.character(at: checkPos + 1)
+                    // Check for << (60, 60 in ASCII)
+                    if char == 60 && nextChar == 60 {
+                        if let matchPos = findClosingBracketEfficient(in: nsText, from: checkPos, openLen: 2, closeLen: 2, openFirst: 60, closeFirst: 62) {
                             return (NSRange(location: checkPos, length: 2), NSRange(location: matchPos, length: 2))
                         }
-                    } else if twoChar == ">>" {
-                        if let matchPos = findOpeningBracket(chars: chars, from: checkPos + 1, open: "<<", close: ">>") {
+                    }
+                    // Check for >> (62, 62 in ASCII)
+                    else if char == 62 && nextChar == 62 {
+                        if let matchPos = findOpeningBracketEfficient(in: nsText, from: checkPos + 1, openLen: 2, closeLen: 2, openFirst: 60, closeFirst: 62) {
                             return (NSRange(location: checkPos, length: 2), NSRange(location: matchPos, length: 2))
                         }
                     }
                 }
 
-                // Check single char brackets
-                let char = String(chars[checkPos])
-                for pair in Self.bracketPairs where pair.open.count == 1 {
-                    if char == pair.open {
-                        if let matchPos = findClosingBracket(chars: chars, from: checkPos, open: pair.open, close: pair.close) {
-                            return (NSRange(location: checkPos, length: 1), NSRange(location: matchPos, length: 1))
-                        }
-                    } else if char == pair.close {
-                        if let matchPos = findOpeningBracket(chars: chars, from: checkPos, open: pair.open, close: pair.close) {
-                            return (NSRange(location: checkPos, length: 1), NSRange(location: matchPos, length: 1))
-                        }
+                // Check single char brackets using Unicode scalars
+                // ( = 40, ) = 41, [ = 91, ] = 93, { = 123, } = 125
+                switch char {
+                case 40: // (
+                    if let matchPos = findClosingBracketEfficient(in: nsText, from: checkPos, openLen: 1, closeLen: 1, openFirst: 40, closeFirst: 41) {
+                        return (NSRange(location: checkPos, length: 1), NSRange(location: matchPos, length: 1))
+                    }
+                case 41: // )
+                    if let matchPos = findOpeningBracketEfficient(in: nsText, from: checkPos, openLen: 1, closeLen: 1, openFirst: 40, closeFirst: 41) {
+                        return (NSRange(location: checkPos, length: 1), NSRange(location: matchPos, length: 1))
+                    }
+                case 91: // [
+                    if let matchPos = findClosingBracketEfficient(in: nsText, from: checkPos, openLen: 1, closeLen: 1, openFirst: 91, closeFirst: 93) {
+                        return (NSRange(location: checkPos, length: 1), NSRange(location: matchPos, length: 1))
+                    }
+                case 93: // ]
+                    if let matchPos = findOpeningBracketEfficient(in: nsText, from: checkPos, openLen: 1, closeLen: 1, openFirst: 91, closeFirst: 93) {
+                        return (NSRange(location: checkPos, length: 1), NSRange(location: matchPos, length: 1))
+                    }
+                case 123: // {
+                    if let matchPos = findClosingBracketEfficient(in: nsText, from: checkPos, openLen: 1, closeLen: 1, openFirst: 123, closeFirst: 125) {
+                        return (NSRange(location: checkPos, length: 1), NSRange(location: matchPos, length: 1))
+                    }
+                case 125: // }
+                    if let matchPos = findOpeningBracketEfficient(in: nsText, from: checkPos, openLen: 1, closeLen: 1, openFirst: 123, closeFirst: 125) {
+                        return (NSRange(location: checkPos, length: 1), NSRange(location: matchPos, length: 1))
+                    }
+                default:
+                    break
+                }
+            }
+
+            return nil
+        }
+
+        /// Efficient forward search for closing bracket with search radius limit
+        private func findClosingBracketEfficient(in text: NSString, from start: Int, openLen: Int, closeLen: Int, openFirst: unichar, closeFirst: unichar) -> Int? {
+            var depth = 1
+            var i = start + openLen
+            let maxPos = min(text.length, start + Self.bracketSearchRadius)
+
+            while i < maxPos {
+                let char = text.character(at: i)
+
+                // Check for close bracket
+                if char == closeFirst {
+                    if closeLen == 1 || (i + 1 < text.length && text.character(at: i + 1) == closeFirst) {
+                        depth -= 1
+                        if depth == 0 { return i }
+                        i += closeLen
+                        continue
                     }
                 }
+
+                // Check for open bracket (nested)
+                if char == openFirst {
+                    if openLen == 1 || (i + 1 < text.length && text.character(at: i + 1) == openFirst) {
+                        depth += 1
+                        i += openLen
+                        continue
+                    }
+                }
+
+                i += 1
+            }
+
+            return nil
+        }
+
+        /// Efficient backward search for opening bracket with search radius limit
+        private func findOpeningBracketEfficient(in text: NSString, from start: Int, openLen: Int, closeLen: Int, openFirst: unichar, closeFirst: unichar) -> Int? {
+            var depth = 1
+            var i = start - 1
+            let minPos = max(0, start - Self.bracketSearchRadius)
+
+            while i >= minPos {
+                let char = text.character(at: i)
+
+                // Check for open bracket
+                if char == openFirst {
+                    if openLen == 1 {
+                        depth -= 1
+                        if depth == 0 { return i }
+                    } else if i > 0 && text.character(at: i - 1) == openFirst {
+                        depth -= 1
+                        if depth == 0 { return i - 1 }
+                        i -= 1
+                    }
+                    i -= 1
+                    continue
+                }
+
+                // Check for close bracket (nested)
+                if char == closeFirst {
+                    if closeLen == 1 {
+                        depth += 1
+                    } else if i > 0 && text.character(at: i - 1) == closeFirst {
+                        depth += 1
+                        i -= 1
+                    }
+                    i -= 1
+                    continue
+                }
+
+                i -= 1
             }
 
             return nil

@@ -647,17 +647,10 @@ final class TLALexer {
         }
     }
 
-    private func scanBackslashOperator() {
-        // Check for TLA+ line comment: \*
-        if peek() == "*" {
-            _ = advance() // consume *
-            scanLineComment()
-            return
-        }
-
-        // Check for multi-character operators starting with \
-        // Order matters: longer matches first
-        let operators: [(String, TLAOperator)] = [
+    /// Static operator lookup table grouped by first character for O(1) initial lookup
+    /// Within each group, operators are sorted by length (longest first) for correct matching
+    private static let operatorsByFirstChar: [Character: [(String, TLAOperator)]] = {
+        let allOperators: [(String, TLAOperator)] = [
             // Logical
             ("lnot", .negationAlt),
             ("land", .conjunctionAlt),
@@ -667,8 +660,10 @@ final class TLALexer {
             // Quantifiers
             ("A", .forall),
             ("E", .exists),
+            ("forall", .forall),
+            ("exists", .exists),
 
-            // Set operations (longer first)
+            // Set operations
             ("subseteq", .subsetOf),
             ("supseteq", .supersetOf),
             ("subset", .properSubset),
@@ -682,7 +677,7 @@ final class TLALexer {
             ("uplus", .uplus),
             ("X", .times),
 
-            // Relations (longer first)
+            // Relations
             ("preceq", .preceq),
             ("prec", .prec),
             ("succeq", .succeq),
@@ -727,10 +722,37 @@ final class TLALexer {
             ("mapsto", .mapsTo),
         ]
 
-        for (suffix, op) in operators {
-            if matchSequence(suffix) {
-                addToken(.operator(op))
-                return
+        // Group by first character and sort by length (longest first)
+        var grouped: [Character: [(String, TLAOperator)]] = [:]
+        for (suffix, op) in allOperators {
+            guard let firstChar = suffix.first else { continue }
+            grouped[firstChar, default: []].append((suffix, op))
+        }
+
+        // Sort each group by length (longest first) for correct matching
+        for (key, value) in grouped {
+            grouped[key] = value.sorted { $0.0.count > $1.0.count }
+        }
+
+        return grouped
+    }()
+
+    private func scanBackslashOperator() {
+        // Check for TLA+ line comment: \*
+        if peek() == "*" {
+            _ = advance() // consume *
+            scanLineComment()
+            return
+        }
+
+        // Fast path: lookup operators by first character
+        let firstChar = peek()
+        if let candidates = Self.operatorsByFirstChar[firstChar] {
+            for (suffix, op) in candidates {
+                if matchSequence(suffix) {
+                    addToken(.operator(op))
+                    return
+                }
             }
         }
 

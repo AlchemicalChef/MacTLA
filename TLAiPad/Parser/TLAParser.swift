@@ -33,6 +33,7 @@ enum TLADeclaration: TLANode {
     case specification(SpecificationDeclaration)
     case invariant(InvariantDeclaration)
     case property(PropertyDeclaration)
+    case recursiveDecl(RecursiveDeclaration)
 
     var location: SourceLocation {
         switch self {
@@ -45,6 +46,7 @@ enum TLADeclaration: TLANode {
         case .specification(let d): return d.location
         case .invariant(let d): return d.location
         case .property(let d): return d.location
+        case .recursiveDecl(let d): return d.location
         }
     }
 }
@@ -56,6 +58,13 @@ struct ConstantDeclaration: TLANode {
 
 struct VariableDeclaration: TLANode {
     let names: [String]
+    let location: SourceLocation
+}
+
+/// Forward declaration for a recursive operator (RECURSIVE op(_))
+struct RecursiveDeclaration: TLANode {
+    let name: String
+    let parameterCount: Int  // Number of parameters declared
     let location: SourceLocation
 }
 
@@ -393,6 +402,7 @@ final class TLAParser {
     private var errors: [ParseError] = []
     private var proofDepth = 0
     private let maxProofDepth = 100  // Prevent stack overflow on deeply nested proofs
+    private var recursiveOperators: Set<String> = []  // Track RECURSIVE forward declarations
 
     struct ParseError: Error, CustomStringConvertible {
         let message: String
@@ -445,6 +455,7 @@ final class TLAParser {
         self.tokens = lexer.scanTokens()
         self.current = 0
         self.errors = []
+        self.recursiveOperators = []  // Reset for new parse
 
         do {
             let module = try parseModule()
@@ -721,11 +732,14 @@ final class TLAParser {
 
         let body = try parseExpression()
 
+        // Check if this operator was declared as RECURSIVE earlier
+        let isRecursive = recursiveOperators.contains(name)
+
         return .operatorDef(OperatorDefinition(
             name: name,
             parameters: parameters,
             body: body,
-            isRecursive: false,
+            isRecursive: isRecursive,
             location: loc
         ))
     }
@@ -739,28 +753,50 @@ final class TLAParser {
         }
         advance()
 
-        var parameters: [OperatorParameter] = []
+        var paramCount = 0
 
-        // Check for parameters
+        // Check for parameters (with underscores for arity)
         if match(.leftParen) {
-            parameters = try parseOperatorParameters()
+            // Count parameters - they can be underscores or names
+            if !check(.rightParen) {
+                repeat {
+                    if case .identifier = peek().type {
+                        advance()
+                        paramCount += 1
+                    } else if case .subscriptSeparator = peek().type {
+                        // Standalone underscore used as placeholder
+                        advance()
+                        paramCount += 1
+                    } else {
+                        throw error("Expected parameter name or '_' in RECURSIVE declaration")
+                    }
+                } while match(.comma)
+            }
             guard match(.rightParen) else {
                 throw error("Expected ')' after parameters")
             }
         }
 
-        guard case .operator(.define) = peek().type else {
-            throw error("Expected '==' in recursive operator definition")
+        // Register this operator as recursive for later definition lookup
+        recursiveOperators.insert(name)
+
+        // Check if definition follows immediately (combined form)
+        if case .operator(.define) = peek().type {
+            advance()
+            let body = try parseExpression()
+            return .operatorDef(OperatorDefinition(
+                name: name,
+                parameters: [],  // Will be filled by actual definition parsing
+                body: body,
+                isRecursive: true,
+                location: loc
+            ))
         }
-        advance()
 
-        let body = try parseExpression()
-
-        return .operatorDef(OperatorDefinition(
+        // Otherwise, return forward declaration only
+        return .recursiveDecl(RecursiveDeclaration(
             name: name,
-            parameters: parameters,
-            body: body,
-            isRecursive: true,
+            parameterCount: paramCount,
             location: loc
         ))
     }
@@ -890,7 +926,7 @@ final class TLAParser {
             }
             advance()
 
-            guard case .operator(.rightArrow) = peek().type else {
+            guard case .operator(.leftArrow) = peek().type else {
                 throw error("Expected '<-' in substitution")
             }
             advance()

@@ -19,6 +19,10 @@ actor ModelChecker {
         var simulationTraceCount: Int = 100     // Number of random traces to generate
         var simulationTraceDepth: Int = 100     // Max depth per trace
 
+        // Bounds for infinite sets (Nat/Int) - increase for specs that need larger values
+        var natUpperBound: Int = 1000           // Nat = 0..natUpperBound
+        var intBound: Int = 1000                // Int = -intBound..intBound
+
         static let `default` = Configuration()
     }
 
@@ -236,6 +240,7 @@ actor ModelChecker {
         let depth: Int
         let successors: [TLAState]
         let successorTraces: [[TLAState]]
+        let actionNames: [String?]  // Action name for each successor (for fairness)
         let isDeadlock: Bool
         let error: VerificationResult?
     }
@@ -260,6 +265,7 @@ actor ModelChecker {
                 depth: depth,
                 successors: [],
                 successorTraces: [],
+                actionNames: [],
                 isDeadlock: false,
                 error: nil
             )
@@ -276,6 +282,7 @@ actor ModelChecker {
                             depth: depth,
                             successors: [],
                             successorTraces: [],
+                            actionNames: [],
                             isDeadlock: false,
                             error: VerificationResult(
                                 specificationName: module.name,
@@ -291,6 +298,7 @@ actor ModelChecker {
                         depth: depth,
                         successors: [],
                         successorTraces: [],
+                        actionNames: [],
                         isDeadlock: false,
                         error: VerificationResult(
                             specificationName: module.name,
@@ -302,16 +310,17 @@ actor ModelChecker {
             }
         }
 
-        // Generate successor states
+        // Generate successor states with action tracking
         do {
-            let successors = try interpreter.evaluateNext(nextDef, state: state, module: module)
+            let successorsWithActions = try interpreter.evaluateNextWithActions(nextDef, state: state, module: module)
 
-            if successors.isEmpty && configuration.checkDeadlock {
+            if successorsWithActions.isEmpty && configuration.checkDeadlock {
                 return BatchResult(
                     fromHash: currentHash,
                     depth: depth,
                     successors: [],
                     successorTraces: [],
+                    actionNames: [],
                     isDeadlock: true,
                     error: VerificationResult(
                         specificationName: module.name,
@@ -322,6 +331,8 @@ actor ModelChecker {
                 )
             }
 
+            let successors = successorsWithActions.map { $0.state }
+            let actionNames = successorsWithActions.map { $0.actionName }
             let successorTraces = successors.map { trace + [$0] }
 
             return BatchResult(
@@ -329,6 +340,7 @@ actor ModelChecker {
                 depth: depth,
                 successors: successors,
                 successorTraces: successorTraces,
+                actionNames: actionNames,
                 isDeadlock: false,
                 error: nil
             )
@@ -338,6 +350,7 @@ actor ModelChecker {
                 depth: depth,
                 successors: [],
                 successorTraces: [],
+                actionNames: [],
                 isDeadlock: false,
                 error: VerificationResult(
                     specificationName: module.name,
@@ -350,6 +363,8 @@ actor ModelChecker {
 
     private func checkModel(_ module: TLAModule) async -> VerificationResult {
         let interpreter = TLAInterpreter()
+        interpreter.natUpperBound = configuration.natUpperBound
+        interpreter.intBound = configuration.intBound
 
         // Apply constant overrides to interpreter
         for override in constantOverrides {
@@ -458,6 +473,8 @@ actor ModelChecker {
                         group.addTask {
                             // Each task gets its own interpreter to avoid data races
                             let taskInterpreter = TLAInterpreter()
+                            taskInterpreter.natUpperBound = capturedConfig.natUpperBound
+                            taskInterpreter.intBound = capturedConfig.intBound
                             // Apply constant overrides
                             for override in capturedOverrides {
                                 taskInterpreter.setConstant(name: override.name, valueString: override.value)
@@ -494,16 +511,19 @@ actor ModelChecker {
                         (batch.first(where: { computeStateHash($0) == result.fromHash }).map { computeStateHash($0) } ?? result.fromHash) :
                         result.fromHash
 
-                    for (successor, successorTrace) in zip(result.successors, result.successorTraces) {
+                    for (index, (successor, successorTrace)) in zip(result.successors, result.successorTraces).enumerated() {
                         statistics.statesGenerated += 1
                         // Use symmetry-aware hash if symmetry is enabled
                         let hash = computeStateHash(successor)
 
-                        // Track transition for visualization
+                        // Get action name for this transition (for fairness checking)
+                        let actionName = index < result.actionNames.count ? result.actionNames[index] : nil
+
+                        // Track transition for visualization with action name
                         stateTransitions.append(StateTransition(
                             fromHash: fromHash,
                             toHash: hash,
-                            action: nil
+                            action: actionName
                         ))
 
                         if !visited.contains(hash) {
@@ -562,13 +582,13 @@ actor ModelChecker {
                     }
                 }
 
-                // Generate successor states
+                // Generate successor states with action tracking
                 do {
-                    let successors = try interpreter.evaluateNext(nextDef, state: currentState, module: module)
+                    let successorsWithActions = try interpreter.evaluateNextWithActions(nextDef, state: currentState, module: module)
                     // Use symmetry-aware hash if symmetry is enabled
                     let currentHash = computeStateHash(currentState)
 
-                    if successors.isEmpty && configuration.checkDeadlock {
+                    if successorsWithActions.isEmpty && configuration.checkDeadlock {
                         // Mark as error state for visualization
                         errorStateHashes.insert(currentHash)
 
@@ -584,7 +604,9 @@ actor ModelChecker {
                         )
                     }
 
-                    for successor in successors {
+                    for successorWithAction in successorsWithActions {
+                        let successor = successorWithAction.state
+                        let actionName = successorWithAction.actionName
                         statistics.statesGenerated += 1
 
                         // Apply action constraints - skip transitions that don't satisfy constraints
@@ -602,11 +624,11 @@ actor ModelChecker {
                         // Use symmetry-aware hash if symmetry is enabled
                         let hash = computeStateHash(successor)
 
-                        // Track transition for visualization
+                        // Track transition for visualization with action name
                         stateTransitions.append(StateTransition(
                             fromHash: currentHash,
                             toHash: hash,
-                            action: nil
+                            action: actionName
                         ))
 
                         if !visited.contains(hash) {
@@ -941,47 +963,91 @@ actor ModelChecker {
         module: TLAModule,
         interpreter: TLAInterpreter
     ) -> TemporalCheckResult {
-        // P ~> Q: from any state where P holds, Q must eventually hold
+        // P ~> Q: from any state where P holds, Q must eventually hold on ALL paths
         // This is equivalent to [](P => <>Q)
+        // A violation is found if there's a P-state from which we can reach
+        // a cycle (or terminal state) without Q ever holding.
 
         // Build successor map
         let successors = buildSuccessorMap()
 
-        // For each state where P holds, check if Q is reachable
+        // Precompute which states satisfy Q
+        var qStates: Set<StateHash> = []
+        for state in exploredStates {
+            if evaluatePredicate(q, in: state, module: module, interpreter: interpreter) {
+                qStates.insert(state.hash)
+            }
+        }
+
+        // For each state where P holds, check if there's any path that avoids Q forever
         for state in exploredStates {
             if evaluatePredicate(p, in: state, module: module, interpreter: interpreter) {
-                // BFS to find Q
-                var visited: Set<StateHash> = []
-                var queue: [StateHash] = [state.hash]
-                var foundQ = false
-
-                while !queue.isEmpty && !foundQ {
-                    let current = queue.removeFirst()
-                    if visited.contains(current) { continue }
-                    visited.insert(current)
-
-                    if let idx = stateHashToIndex[current] {
-                        if evaluatePredicate(q, in: exploredStates[idx], module: module, interpreter: interpreter) {
-                            foundQ = true
-                            break
-                        }
-                    }
-
-                    for succHash in successors[current] ?? [] {
-                        if !visited.contains(succHash) {
-                            queue.append(succHash)
-                        }
-                    }
+                // If this state already satisfies Q, no violation from here
+                if qStates.contains(state.hash) {
+                    continue
                 }
 
-                if !foundQ {
-                    // Found a P-state from which Q is never reached
-                    return TemporalCheckResult(
-                        property: .leadsto(p, q),
-                        holds: false,
-                        counterexample: [state],
-                        loopStart: nil
-                    )
+                // DFS to find a path that leads to a cycle or terminal state without Q
+                // We track the path to detect cycles via the stack tuple
+                var visited: Set<StateHash> = []
+                var stack: [(StateHash, [StateHash])] = [(state.hash, [])]
+
+                while !stack.isEmpty {
+                    let (current, currentPath) = stack.removeLast()
+
+                    // Skip if current satisfies Q
+                    if qStates.contains(current) {
+                        continue
+                    }
+
+                    // Cycle detected without Q - violation!
+                    if currentPath.contains(current) {
+                        // Found a cycle that doesn't pass through Q
+                        if let loopIdx = currentPath.firstIndex(of: current) {
+                            let cyclePath = Array(currentPath[loopIdx...])
+                            let counterexampleStates = cyclePath.compactMap { hash -> TLAState? in
+                                if let idx = stateHashToIndex[hash] {
+                                    return exploredStates[idx]
+                                }
+                                return nil
+                            }
+                            // Loop starts at index 1 (after the initial P-state)
+                            return TemporalCheckResult(
+                                property: .leadsto(p, q),
+                                holds: false,
+                                counterexample: [state] + counterexampleStates,
+                                loopStart: 1
+                            )
+                        }
+                    }
+
+                    if visited.contains(current) {
+                        continue
+                    }
+                    visited.insert(current)
+
+                    let succs = successors[current] ?? []
+
+                    // Deadlock (terminal state) without Q - violation!
+                    if succs.isEmpty {
+                        let counterexampleStates = (currentPath + [current]).compactMap { hash -> TLAState? in
+                            if let idx = stateHashToIndex[hash] {
+                                return exploredStates[idx]
+                            }
+                            return nil
+                        }
+                        return TemporalCheckResult(
+                            property: .leadsto(p, q),
+                            holds: false,
+                            counterexample: [state] + counterexampleStates,
+                            loopStart: nil
+                        )
+                    }
+
+                    let newPath = currentPath + [current]
+                    for succHash in succs {
+                        stack.append((succHash, newPath))
+                    }
                 }
             }
         }
@@ -1504,7 +1570,13 @@ actor ModelChecker {
             tracesGenerated += 1
 
             // Pick a random initial state
-            let initialState = initialStates.randomElement()!
+            guard let initialState = initialStates.randomElement() else {
+                return VerificationResult(
+                    specificationName: module.name,
+                    status: .error,
+                    error: "No initial states available for simulation"
+                )
+            }
             var currentState = initialState
             var trace: [TLAState] = [currentState]
             var depth = 0
@@ -1571,7 +1643,9 @@ actor ModelChecker {
                     }
 
                     // Pick a random successor
-                    let nextState = successors.randomElement()!
+                    guard let nextState = successors.randomElement() else {
+                        break // No successors available, end trace
+                    }
                     trace.append(nextState)
                     currentState = nextState
 
@@ -1800,7 +1874,12 @@ enum TLAValue: Hashable, CustomStringConvertible, Sendable {
     var sortKey: String {
         switch self {
         case .boolean(let b): return "0_\(b ? "1" : "0")"
-        case .integer(let n): return "1_\(String(format: "%020d", n + Int.max/2))"  // Pad for proper sorting
+        case .integer(let n):
+            // Use sign prefix + absolute value for safe overflow-free sorting
+            // Negatives sort before positives: "1_0_..." < "1_1_..."
+            let signPrefix = n < 0 ? "0" : "1"
+            let absValue = n < 0 ? UInt64(bitPattern: Int64(n) == Int64.min ? Int64.max : -Int64(n)) : UInt64(n)
+            return "1_\(signPrefix)_\(String(format: "%020llu", absValue))"
         case .string(let s): return "2_\(s)"
         case .set(let s): return "3_\(s.map(\.sortKey).sorted().joined(separator: ","))"
         case .sequence(let seq): return "4_\(seq.map(\.sortKey).joined(separator: ","))"

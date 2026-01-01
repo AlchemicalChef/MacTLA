@@ -10,6 +10,7 @@ struct EditorDetailView: View {
     @State private var showConfigEditor = false
     @State private var showError = false
     @State private var errorMessage = ""
+    @State private var diagnosticsWorkItem: DispatchWorkItem?
 
     var body: some View {
         if let file = appState.selectedFile {
@@ -90,7 +91,7 @@ struct EditorDetailView: View {
             }
             .onAppear {
                 if file.type == .specification || file.type == .pluscal {
-                    updateDiagnostics(for: file.content)
+                    updateDiagnosticsImmediately(for: file.content)
                 } else {
                     diagnostics = []
                 }
@@ -122,7 +123,32 @@ struct EditorDetailView: View {
     }
 
     private func updateDiagnostics(for content: String) {
-        diagnostics = TLADiagnostics.shared.analyze(content)
+        // Cancel any pending diagnostics work
+        diagnosticsWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [content] in
+            // Run analysis on background thread
+            Task.detached(priority: .utility) {
+                let results = TLADiagnostics.shared.analyze(content)
+                await MainActor.run {
+                    diagnostics = results
+                }
+            }
+        }
+        diagnosticsWorkItem = workItem
+
+        // Debounce: wait 500ms before running diagnostics
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: workItem)
+    }
+
+    /// Immediately run diagnostics without debouncing (for onAppear)
+    private func updateDiagnosticsImmediately(for content: String) {
+        Task.detached(priority: .utility) {
+            let results = TLADiagnostics.shared.analyze(content)
+            await MainActor.run {
+                diagnostics = results
+            }
+        }
     }
 
     private func navigateToDiagnostic(_ diagnostic: TLADiagnostics.Diagnostic) {

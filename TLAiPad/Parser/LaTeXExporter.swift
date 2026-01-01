@@ -133,6 +133,10 @@ class LaTeXExporter {
 
         case .property(let d):
             return "\\textsc{property} \(d.names.map(escapeLatex).joined(separator: ", "))\n"
+
+        case .recursiveDecl(let d):
+            let params = d.parameterCount > 0 ? "(\(Array(repeating: "\\_", count: d.parameterCount).joined(separator: ", ")))" : ""
+            return "\\textsc{recursive} \(escapeLatex(d.name))\(params)\n"
         }
     }
 

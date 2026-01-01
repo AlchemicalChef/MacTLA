@@ -63,6 +63,8 @@ struct iOSTextEditor: UIViewRepresentable {
     class Coordinator: NSObject, UITextViewDelegate {
         var parent: iOSTextEditor
         private var isUpdating = false
+        private var highlightWorkItem: DispatchWorkItem?
+        private var lineNumberWorkItem: DispatchWorkItem?
 
         init(_ parent: iOSTextEditor) {
             self.parent = parent
@@ -76,18 +78,28 @@ struct iOSTextEditor: UIViewRepresentable {
             parent.text = textView.text
             parent.onChange?(textView.text)
 
-            // Re-apply syntax highlighting after text change
-            if let editorView = textView.superview as? iOSTextEditorView {
-                editorView.applySyntaxHighlighting(using: parent.highlighter)
+            // Debounce syntax highlighting (100ms)
+            highlightWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak self, weak textView] in
+                guard let textView = textView,
+                      let editorView = textView.superview as? iOSTextEditorView else { return }
+                editorView.applySyntaxHighlighting(using: self?.parent.highlighter ?? TLASyntaxHighlighter.shared)
                 editorView.updateLineNumbers()
             }
+            highlightWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: workItem)
         }
 
         func textViewDidChangeSelection(_ textView: UITextView) {
-            // Update line numbers to highlight current line
-            if let editorView = textView.superview as? iOSTextEditorView {
-                editorView.updateLineNumbers()
+            // Debounce line number updates on selection change (50ms)
+            lineNumberWorkItem?.cancel()
+            let workItem = DispatchWorkItem { [weak textView] in
+                if let editorView = textView?.superview as? iOSTextEditorView {
+                    editorView.updateLineNumbers()
+                }
             }
+            lineNumberWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
         }
     }
 }
@@ -98,6 +110,10 @@ class iOSTextEditorView: UIView {
     private let lineNumberView: UITextView
     private let scrollView: UIScrollView
     private var showLineNumbers: Bool = true
+
+    // Cached values for line number optimization
+    private var cachedLineCount: Int = 0
+    private var cachedCurrentLine: Int = 0
 
     var text: String {
         get { textView.text }
@@ -214,22 +230,30 @@ class iOSTextEditorView: UIView {
         guard showLineNumbers else { return }
 
         let text = textView.text ?? ""
-        let lines = text.components(separatedBy: "\n")
-        let lineCount = lines.count
 
-        // Get current cursor line
+        // Efficiently count lines without creating array
+        let newLineCount = text.isEmpty ? 1 : text.filter { $0 == "\n" }.count + 1
+
+        // Get current cursor line efficiently
         let cursorPosition = textView.selectedRange.location
         var currentLine = 1
         var charCount = 0
-        for (index, line) in lines.enumerated() {
-            charCount += line.count + 1 // +1 for newline
-            if charCount > cursorPosition {
-                currentLine = index + 1
-                break
-            }
+        for char in text {
+            if charCount >= cursorPosition { break }
+            charCount += 1
+            if char == "\n" { currentLine += 1 }
         }
 
+        // Only rebuild if line count or current line changed
+        guard newLineCount != cachedLineCount || currentLine != cachedCurrentLine else { return }
+        cachedLineCount = newLineCount
+        cachedCurrentLine = currentLine
+
         // Build line numbers string
+        rebuildLineNumberText(lineCount: newLineCount, currentLine: currentLine)
+    }
+
+    private func rebuildLineNumberText(lineCount: Int, currentLine: Int) {
         let lineNumbers = (1...max(lineCount, 1)).map { lineNum -> NSAttributedString in
             let color: UIColor = lineNum == currentLine ? .label : .secondaryLabel
             return NSAttributedString(
