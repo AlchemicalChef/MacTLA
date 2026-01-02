@@ -190,6 +190,9 @@ class LaTeXExporter {
             let bs = bindings.map { "\(convertBoundVariable($0))" }
             return "[\(bs.joined(separator: ", ")) $\\mapsto$ \(convertExpression(body))]"
 
+        case .functionSet(let domain, let codomain, _):
+            return "[\(convertExpression(domain)) $\\rightarrow$ \(convertExpression(codomain))]"
+
         case .setComprehension(let binding, let predicate, _):
             return "\\{\(convertBoundVariable(binding)): \(convertExpression(predicate))\\}"
 

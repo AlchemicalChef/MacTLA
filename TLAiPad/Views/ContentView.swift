@@ -307,6 +307,9 @@ struct ContentView: View {
             )
             appState.verificationResults.append(result)
 
+            // Write verification result to Validator.txt
+            writeValidatorLog(result: result, fileName: file.name)
+
             // Build graph for visualization (simplified)
             if result.status == .success || result.status == .failure {
                 buildStateGraph(from: result)
@@ -447,6 +450,78 @@ struct ContentView: View {
             name: .navigateToLine,
             object: symbol.location
         )
+    }
+
+    /// Writes verification result to Validator.txt for debugging/analysis
+    private func writeValidatorLog(result: VerificationResult, fileName: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        var log = """
+        ================================================================================
+        [\(timestamp)] Verification: \(fileName)
+        ================================================================================
+        Specification: \(result.specificationName)
+        Status: \(result.status.rawValue)
+        States Explored: \(result.statesExplored)
+        Distinct States: \(result.distinctStates)
+        Duration: \(String(format: "%.2f", result.duration))s
+
+        """
+
+        if let error = result.error {
+            log += "Error: \(error)\n"
+        }
+
+        if let violated = result.violatedInvariant {
+            log += "\nViolated Invariant: \(violated)\n"
+        }
+
+        if let details = result.errorDetails {
+            log += "\nError Details:\n"
+            log += "  Kind: \(details.kind)\n"
+            log += "  Message: \(details.message)\n"
+            if let location = details.location {
+                log += "  Location: Line \(location.line), Column \(location.column)\n"
+            }
+            if let context = details.context {
+                log += "  Context: \(context)\n"
+            }
+            if !details.suggestions.isEmpty {
+                log += "  Suggestions:\n"
+                for suggestion in details.suggestions {
+                    log += "    - \(suggestion)\n"
+                }
+            }
+        }
+
+        if !result.counterexample.isEmpty {
+            log += "\nCounterexample Trace:\n"
+            for (index, traceState) in result.counterexample.enumerated() {
+                log += "  Step \(traceState.stepNumber): \(traceState.action)\n"
+                for (varName, value) in traceState.variables.sorted(by: { $0.key < $1.key }) {
+                    log += "    \(varName) = \(value)\n"
+                }
+            }
+        }
+
+        if !result.output.isEmpty {
+            log += "\nOutput:\n\(result.output)\n"
+        }
+
+        log += "\n"
+
+        // Write to file
+        let path = "/Users/night/Documents/GitHub/MacTLA/Validator.txt"
+        if let data = log.data(using: String.Encoding.utf8) {
+            if FileManager.default.fileExists(atPath: path) {
+                if let handle = FileHandle(forWritingAtPath: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: path, contents: data)
+            }
+        }
     }
 }
 

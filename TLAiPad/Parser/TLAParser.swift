@@ -168,6 +168,7 @@ indirect enum TLAExpression: TLANode {
     // Functions
     case functionApplication(TLAExpression, [TLAExpression], SourceLocation)
     case functionConstruction([BoundVariable], TLAExpression, SourceLocation)
+    case functionSet(TLAExpression, TLAExpression, SourceLocation)  // [S -> T] - set of all functions from S to T
     case except(TLAExpression, [ExceptClause], SourceLocation)
 
     // Records
@@ -219,6 +220,7 @@ indirect enum TLAExpression: TLANode {
              .setRange(_, _, let loc),
              .functionApplication(_, _, let loc),
              .functionConstruction(_, _, let loc),
+             .functionSet(_, _, let loc),
              .except(_, _, let loc),
              .recordConstruction(_, let loc),
              .recordAccess(_, _, let loc),
@@ -403,6 +405,7 @@ final class TLAParser {
     private var proofDepth = 0
     private let maxProofDepth = 100  // Prevent stack overflow on deeply nested proofs
     private var recursiveOperators: Set<String> = []  // Track RECURSIVE forward declarations
+    private let junctionCtx = JunctionListContext()  // Track indentation-based junction lists
 
     struct ParseError: Error, CustomStringConvertible {
         let message: String
@@ -456,6 +459,7 @@ final class TLAParser {
         self.current = 0
         self.errors = []
         self.recursiveOperators = []  // Reset for new parse
+        self.junctionCtx.reset()  // Reset junction list context
 
         do {
             let module = try parseModule()
@@ -533,12 +537,18 @@ final class TLAParser {
             advance()
         }
 
+        // Skip any comments before EXTENDS
+        skipComments()
+
         // Parse EXTENDS
         var extends: [String] = []
         if case .keyword(.extends) = peek().type {
             advance()
             extends = try parseIdentifierList()
         }
+
+        // Skip comments after EXTENDS
+        skipComments()
 
         // Parse declarations with error recovery
         var declarations: [TLADeclaration] = []
@@ -562,21 +572,37 @@ final class TLAParser {
     private func parseIdentifierList() throws -> [String] {
         var identifiers: [String] = []
 
+        skipComments()
         guard case .identifier(let first) = peek().type else {
             throw error("Expected identifier")
         }
         identifiers.append(first)
         advance()
+        skipComments()
 
         while match(.comma) {
+            skipComments()
             guard case .identifier(let name) = peek().type else {
                 throw error("Expected identifier after comma")
             }
             identifiers.append(name)
             advance()
+            skipComments()
         }
 
         return identifiers
+    }
+
+    /// Skip any comment tokens at current position
+    private func skipComments() {
+        while true {
+            switch peek().type {
+            case .comment, .blockComment:
+                advance()
+            default:
+                return
+            }
+        }
     }
 
     /// Parse operator parameters - supports both value parameters (x) and operator parameters (F(_), G(_, _))
@@ -985,7 +1011,107 @@ final class TLAParser {
     // 15. Record access . - Level 17-17
 
     private func parseExpression() throws -> TLAExpression {
+        // Skip any leading comments before expression
+        skipComments()
+
+        // Check for junction list (indentation-based /\ or \/ at start)
+        if case .operator(.conjunction) = peek().type {
+            return try parseJunctionList(type: .conjunction)
+        }
+        if case .operator(.disjunction) = peek().type {
+            return try parseJunctionList(type: .disjunction)
+        }
         return try parseLeadsto()  // Leadsto is lowest precedence
+    }
+
+    /// Parse an indentation-based junction list (conjunction or disjunction)
+    /// Based on SANY's JunctionListContext approach.
+    ///
+    /// TLA+ junction lists use column alignment:
+    /// ```
+    /// /\ A
+    /// /\ B
+    ///    /\ C    <- nested list (indented)
+    ///    /\ D
+    /// /\ E       <- back to outer list
+    /// ```
+    /// Parses as: A /\ B /\ (C /\ D) /\ E
+    private func parseJunctionList(type: JunctionListContext.JunctionType) throws -> TLAExpression {
+        let bulletToken = peek()
+        let bulletColumn = bulletToken.column
+        let loc = currentLocation
+
+        // Start tracking this junction list
+        junctionCtx.startNewJunctionList(type: type, column: bulletColumn, line: bulletToken.line)
+
+        // Consume first bullet
+        advance()
+        skipComments()
+
+        // Parse the first item - it may contain nested junction lists
+        var left = try parseJunctionItem()
+        skipComments()
+
+        // Continue parsing items at the same column
+        while isJunctionBullet(type: type, atColumn: bulletColumn) {
+            advance() // consume the bullet
+            skipComments()
+            let right = try parseJunctionItem()
+            skipComments()
+
+            let op: TLABinaryOp = (type == .conjunction) ? .and : .or
+            left = .binary(left, op, right, loc)
+        }
+
+        // Terminate this junction list
+        junctionCtx.terminateCurrentJunctionList()
+
+        return left
+    }
+
+    /// Check if current token is a junction bullet of the given type at the specified column
+    private func isJunctionBullet(type: JunctionListContext.JunctionType, atColumn column: Int) -> Bool {
+        let token = peek()
+        guard token.column == column else { return false }
+
+        switch type {
+        case .conjunction:
+            if case .operator(.conjunction) = token.type { return true }
+        case .disjunction:
+            if case .operator(.disjunction) = token.type { return true }
+        }
+        return false
+    }
+
+    /// Parse a single item within a junction list
+    /// This may recursively start a nested junction list if we see an indented bullet
+    private func parseJunctionItem() throws -> TLAExpression {
+        skipComments()
+
+        // Check for nested junction list (indented bullet)
+        let token = peek()
+        if case .operator(.conjunction) = token.type {
+            // Only treat as nested list if column is greater than current list's column
+            if let current = junctionCtx.current, token.column > current.column {
+                return try parseJunctionList(type: .conjunction)
+            }
+            // If at same column or less, this isn't a nested list - should not parse as expression
+            // This case should be handled by the caller (isJunctionBullet check)
+        }
+        if case .operator(.disjunction) = token.type {
+            if let current = junctionCtx.current {
+                if token.column > current.column {
+                    return try parseJunctionList(type: .disjunction)
+                }
+                // Bullet at same or lesser column - this is handled by caller, shouldn't reach here during normal parsing
+            } else {
+                // Not in a junction list context - this is a top-level disjunction
+                return try parseJunctionList(type: .disjunction)
+            }
+        }
+
+        // Parse a regular expression (non-bulleted)
+        return try parseLeadsto()
     }
 
     private func parseLeadsto() throws -> TLAExpression {
@@ -1484,6 +1610,10 @@ final class TLAParser {
             advance()
             return .boolean(false, loc)
 
+        case .at:
+            advance()
+            return .identifier("@", loc)  // @ refers to old value in EXCEPT
+
         default:
             throw error("Unexpected token: \(token.lexeme)")
         }
@@ -1571,6 +1701,8 @@ final class TLAParser {
         let loc = currentLocation
         advance() // {
 
+        skipComments()  // Skip any comments after {
+
         if match(.rightBrace) {
             return .setEnumeration([], loc)
         }
@@ -1653,9 +1785,13 @@ final class TLAParser {
 
         // Set enumeration
         var elements = [first]
+        skipComments()
         while match(.comma) {
+            skipComments()
             elements.append(try parseExpression())
+            skipComments()
         }
+        skipComments()
         guard match(.rightBrace) else {
             throw error("Expected '}' after set elements")
         }
@@ -1683,44 +1819,51 @@ final class TLAParser {
             }
         }
 
-        // Check if this is a simple [expr] for stuttering operator [A]_v
-        // We need to distinguish [expr] from [x \in S |-> expr]
-        // Look ahead to see if we have the function construction pattern
+        // Check if this is function construction [x \in S |-> expr]
+        // Look for the pattern: identifier \in ...
         if case .identifier(_) = peek().type {
             let next = peekNext()
-            // If next is ] or _ (subscript separator), this is [expr] for stuttering
-            if case .rightBracket = next.type {
-                let expr = try parseExpression()
-                guard match(.rightBracket) else {
-                    throw error("Expected ']' after expression")
-                }
-                return expr
-            }
-            // If next is not \in, this is [expr] for stuttering
             if case .operator(.elementOf) = next.type {
                 // This is function construction: [x \in S |-> expr]
-            } else {
-                // This is [expr] for stuttering
-                let expr = try parseExpression()
-                guard match(.rightBracket) else {
-                    throw error("Expected ']' after expression")
+                let boundVars = try parseBoundVariables()
+                guard case .operator(.mapsto) = peek().type else {
+                    throw error("Expected '|->' in function construction")
                 }
-                return expr
+                advance()
+                let body = try parseExpression()
+                guard match(.rightBracket) else {
+                    throw error("Expected ']' after function construction")
+                }
+                return .functionConstruction(boundVars, body, loc)
             }
         }
 
-        // Function construction: [x \in S |-> expr]
-        let boundVars = try parseBoundVariables()
-        guard case .operator(.mapsto) = peek().type else {
-            throw error("Expected '|->' in function construction")
-        }
-        advance()
-        let body = try parseExpression()
-        guard match(.rightBracket) else {
-            throw error("Expected ']' after function construction")
+        // At this point, parse a general expression and determine what follows
+        // This handles:
+        //   [S -> T]  - function set
+        //   [expr]    - stuttering expression for [A]_v
+        let firstExpr = try parseExpression()
+
+        skipComments()
+
+        // Check for function set: [S -> T]
+        if case .operator(.rightArrow) = peek().type {
+            advance()
+            skipComments()
+            let codomainExpr = try parseExpression()
+            skipComments()
+            guard match(.rightBracket) else {
+                throw error("Expected ']' after function set")
+            }
+            return .functionSet(firstExpr, codomainExpr, loc)
         }
 
-        return .functionConstruction(boundVars, body, loc)
+        // Otherwise this is [expr] for stuttering operator [A]_v
+        skipComments()
+        guard match(.rightBracket) else {
+            throw error("Expected ']' after expression")
+        }
+        return firstExpr
     }
 
     private func parseExceptExpression(location: SourceLocation) throws -> TLAExpression {
@@ -1947,20 +2090,25 @@ final class TLAParser {
     private func parseIfThenElse() throws -> TLAExpression {
         let loc = currentLocation
         advance() // IF
+        skipComments()
 
         let condition = try parseExpression()
+        skipComments()
 
         guard case .keyword(.then) = peek().type else {
             throw error("Expected 'THEN' after IF condition")
         }
         advance()
+        skipComments()
 
         let thenBranch = try parseExpression()
+        skipComments()
 
         guard case .keyword(.else_) = peek().type else {
             throw error("Expected 'ELSE' in IF expression")
         }
         advance()
+        skipComments()
 
         let elseBranch = try parseExpression()
 
@@ -1970,20 +2118,24 @@ final class TLAParser {
     private func parseLetIn() throws -> TLAExpression {
         let loc = currentLocation
         advance() // LET
+        skipComments()
 
         var definitions: [OperatorDefinition] = []
 
         // Parse at least one definition
+        skipComments()
         if case .identifier(_) = peek().type {
             guard case .operatorDef(let def) = try parseOperatorDefinition() else {
                 throw error("Expected operator definition in LET")
             }
             definitions.append(def)
+            skipComments()
         } else {
             throw error("Expected at least one operator definition after LET")
         }
 
         // Parse remaining definitions
+        skipComments()
         while case .identifier(_) = peek().type {
             // Check that next token looks like a definition (has ==)
             if case .operator(.define) = peekNext().type {
@@ -1999,12 +2151,15 @@ final class TLAParser {
                 throw error("Expected operator definition in LET")
             }
             definitions.append(def)
+            skipComments()
         }
 
+        skipComments()
         guard case .keyword(.in_) = peek().type else {
             throw error("Expected 'IN' after LET definitions (found \(peek().lexeme))")
         }
         advance()
+        skipComments()
 
         let body = try parseExpression()
 
@@ -2014,27 +2169,34 @@ final class TLAParser {
     private func parseCaseExpression() throws -> TLAExpression {
         let loc = currentLocation
         advance() // CASE
+        skipComments()
 
         var arms: [CaseArm] = []
         var other: TLAExpression? = nil
 
         repeat {
+            skipComments()
             if case .keyword(.other) = peek().type {
                 advance()
+                skipComments()
                 guard case .operator(.rightArrow) = peek().type else {
                     throw error("Expected '->' after OTHER")
                 }
                 advance()
+                skipComments()
                 other = try parseExpression()
                 break
             }
 
             let condition = try parseExpression()
+            skipComments()
             guard case .operator(.rightArrow) = peek().type else {
                 throw error("Expected '->' in CASE arm")
             }
             advance()
+            skipComments()
             let result = try parseExpression()
+            skipComments()
             arms.append(CaseArm(condition: condition, result: result))
         } while match(.operator(.always)) // [] is the case separator (box operator)
 
@@ -2100,10 +2262,14 @@ final class TLAParser {
     private func parseExpressionList() throws -> [TLAExpression] {
         var expressions: [TLAExpression] = []
 
+        skipComments()
         if !check(.rightBracket) && !check(.rightParen) && !check(.rightBrace) {
             expressions.append(try parseExpression())
+            skipComments()
             while match(.comma) {
+                skipComments()
                 expressions.append(try parseExpression())
+                skipComments()
             }
         }
 

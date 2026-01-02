@@ -52,6 +52,7 @@ final class TLASyntaxHighlighter {
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
         let lineOffsets = precomputeLineOffsets(in: source)
+        let sourceCount = source.count  // Cache - String.count is O(n)
 
         var attributedString = AttributedString(source)
 
@@ -59,7 +60,7 @@ final class TLASyntaxHighlighter {
             guard token.length > 0 else { continue }
 
             let offset = characterOffset(for: token, using: lineOffsets)
-            guard offset < source.count else { continue }
+            guard offset < sourceCount else { continue }
 
             let startIndex = source.index(source.startIndex, offsetBy: offset)
             guard startIndex < source.endIndex else { continue }
@@ -181,6 +182,7 @@ extension TLASyntaxHighlighter {
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
         let lineOffsets = precomputeLineOffsets(in: source)
+        let sourceCount = source.count  // Cache - String.count is O(n)
 
         // Create mutable attributed string with default attributes
         let attributedString = NSMutableAttributedString(string: source, attributes: [
@@ -192,9 +194,9 @@ extension TLASyntaxHighlighter {
             guard token.length > 0 else { continue }
 
             let offset = characterOffset(for: token, using: lineOffsets)
-            guard offset < source.count else { continue }
+            guard offset < sourceCount else { continue }
 
-            let length = min(token.length, source.count - offset)
+            let length = min(token.length, sourceCount - offset)
             let range = NSRange(location: offset, length: length)
 
             let (swiftUIColor, style) = colorAndStyle(for: token.type, theme: theme)
@@ -265,6 +267,7 @@ extension TLASyntaxHighlighter {
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
         let lineOffsets = precomputeLineOffsets(in: source)
+        let sourceCount = source.count  // Cache - String.count is O(n)
 
         // Create mutable attributed string with default attributes
         let attributedString = NSMutableAttributedString(string: source, attributes: [
@@ -276,9 +279,9 @@ extension TLASyntaxHighlighter {
             guard token.length > 0 else { continue }
 
             let offset = characterOffset(for: token, using: lineOffsets)
-            guard offset < source.count else { continue }
+            guard offset < sourceCount else { continue }
 
-            let length = min(token.length, source.count - offset)
+            let length = min(token.length, sourceCount - offset)
             let range = NSRange(location: offset, length: length)
 
             let (swiftUIColor, style) = colorAndStyle(for: token.type, theme: theme)
@@ -313,14 +316,15 @@ extension TLASyntaxHighlighter {
         let lexer = TLALexer(source: source)
         let tokens = lexer.scanTokens()
         let lineOffsets = precomputeLineOffsets(in: source)
+        let sourceCount = source.count  // Cache - String.count is O(n)
 
         for token in tokens {
             guard token.length > 0 else { continue }
 
             let offset = characterOffset(for: token, using: lineOffsets)
-            guard offset < source.count else { continue }
+            guard offset < sourceCount else { continue }
 
-            let length = min(token.length, source.count - offset)
+            let length = min(token.length, sourceCount - offset)
             let range = NSRange(location: offset, length: length)
 
             let (swiftUIColor, style) = colorAndStyle(for: token.type, theme: theme)
@@ -351,6 +355,7 @@ extension TLASyntaxHighlighter {
         guard !source.isEmpty else { return }
 
         let lineOffsets = precomputeLineOffsets(in: source)
+        let sourceCount = source.count  // Cache - String.count is O(n)
 
         // Collect all attributes first for batching
         var attributeOperations: [(NSRange, NSColor, NSFont?)] = []
@@ -359,9 +364,9 @@ extension TLASyntaxHighlighter {
             guard token.length > 0 else { continue }
 
             let offset = characterOffset(for: token, using: lineOffsets)
-            guard offset < source.count else { continue }
+            guard offset < sourceCount else { continue }
 
-            let length = min(token.length, source.count - offset)
+            let length = min(token.length, sourceCount - offset)
             let range = NSRange(location: offset, length: length)
 
             let (swiftUIColor, style) = colorAndStyle(for: token.type, theme: theme)
@@ -404,6 +409,7 @@ extension TLASyntaxHighlighter {
         guard !source.isEmpty else { return [] }
 
         let lineOffsets = precomputeLineOffsets(in: source)
+        let sourceCount = source.count  // IMPORTANT: Cache this! String.count is O(n) in Swift
         var operations: [HighlightOperation] = []
         operations.reserveCapacity(tokens.count / 2)  // Rough estimate after filtering
 
@@ -414,9 +420,9 @@ extension TLASyntaxHighlighter {
             if shouldSkipToken(token.type) { continue }
 
             let offset = characterOffset(for: token, using: lineOffsets)
-            guard offset < source.count else { continue }
+            guard offset < sourceCount else { continue }
 
-            let length = min(token.length, source.count - offset)
+            let length = min(token.length, sourceCount - offset)
             let range = NSRange(location: offset, length: length)
             let key = colorKey(for: token.type)
 
@@ -452,6 +458,7 @@ extension TLASyntaxHighlighter {
         guard !source.isEmpty else { return }
 
         let lineOffsets = precomputeLineOffsets(in: source)
+        let sourceCount = source.count  // IMPORTANT: Cache this! String.count is O(n) in Swift
 
         // Pre-cache NSColor objects for better performance
         let colorCache = buildColorCache(theme: theme)
@@ -464,9 +471,9 @@ extension TLASyntaxHighlighter {
             if shouldSkipToken(token.type) { continue }
 
             let offset = characterOffset(for: token, using: lineOffsets)
-            guard offset < source.count else { continue }
+            guard offset < sourceCount else { continue }
 
-            let length = min(token.length, source.count - offset)
+            let length = min(token.length, sourceCount - offset)
             let range = NSRange(location: offset, length: length)
 
             // Use cached color lookup

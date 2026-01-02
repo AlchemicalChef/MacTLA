@@ -30,6 +30,7 @@ enum TLATokenType: Equatable {
     case exclamation        // ! (used in EXCEPT expressions)
     case pipe               // | (used in set builder notation)
     case subscriptSeparator // _ (used in [A]_v and <<A>>_v when not part of identifier)
+    case at                 // @ (used in EXCEPT for old value reference)
 
     // Special
     case moduleStart       // ----
@@ -437,7 +438,7 @@ final class TLALexer {
             if match("@") {
                 addToken(.operator(.functionOverride))
             } else {
-                addToken(.unknown("@"))
+                addToken(.at)  // @ is used in EXCEPT expressions for old value
             }
         case "!":
             addToken(.exclamation)

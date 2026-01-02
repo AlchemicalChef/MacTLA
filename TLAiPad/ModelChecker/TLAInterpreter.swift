@@ -797,6 +797,52 @@ final class TLAInterpreter {
             }
             return .function(function)
 
+        case .functionSet(let domain, let codomain, _):
+            // [S -> T] - the set of all functions from S to T
+            let domainVal = try evaluate(domain, in: env)
+            let codomainVal = try evaluate(codomain, in: env)
+            guard case .set(let domainSet) = domainVal else {
+                throw InterpreterError.typeMismatch(expected: "Set for domain", got: "\(domainVal)")
+            }
+            guard case .set(let codomainSet) = codomainVal else {
+                throw InterpreterError.typeMismatch(expected: "Set for codomain", got: "\(codomainVal)")
+            }
+
+            // Generate all possible functions from domain to codomain
+            // Size is |codomain|^|domain|
+            let domainArray = Array(domainSet)
+            let codomainArray = Array(codomainSet)
+
+            if domainArray.isEmpty {
+                // [{}-> T] = {<<>>} - the single empty function
+                return .set([.function([:])])
+            }
+
+            // Limit size to prevent memory exhaustion
+            let numFunctions = Int(pow(Double(codomainArray.count), Double(domainArray.count)))
+            let maxFunctions = 10_000
+            guard numFunctions <= maxFunctions else {
+                throw InterpreterError.evaluationError("Function set [\(domainSet.count) -> \(codomainSet.count)] would create \(numFunctions) functions - limit is \(maxFunctions)")
+            }
+
+            // Generate all functions by iterating through all combinations
+            var allFunctions: Set<TLAValue> = []
+
+            func generateFunctions(index: Int, current: [TLAValue: TLAValue]) {
+                if index == domainArray.count {
+                    allFunctions.insert(.function(current))
+                    return
+                }
+                for coVal in codomainArray {
+                    var next = current
+                    next[domainArray[index]] = coVal
+                    generateFunctions(index: index + 1, current: next)
+                }
+            }
+
+            generateFunctions(index: 0, current: [:])
+            return .set(allFunctions)
+
         case .except(let base, let clauses, _):
             // [f EXCEPT ![x] = v] or [f EXCEPT ![x][y] = v] - functional update with nested paths
             var result = try evaluate(base, in: env)
